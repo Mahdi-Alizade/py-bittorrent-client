@@ -8,7 +8,7 @@ class BDecoder:
     
     def __init__(self, data):
         if isinstance(data, str):
-            data = data.encode('latin-1') # Convert text back to bytes
+            data = data.encode('latin-1')
         self.data = bytearray(data)
         self.pos = 0
 
@@ -33,7 +33,6 @@ class BDecoder:
             raise ValueError(f"Unknown bencoding marker: {key}")
 
     def _parse_int(self):
-        # Format: i<number>e
         end = self.data.index(ord('e'), self.pos + 1)
         number_str = self.data[self.pos + 1:end].decode('latin-1')
         self.pos = end + 1
@@ -44,13 +43,11 @@ class BDecoder:
         return num
 
     def _parse_string(self):
-        # Format: <length>:<string>
         colon = self.data.index(ord(':'), self.pos)
         length = int(self.data[self.pos:colon].decode('latin-1'))
         self.pos = colon + 1
         
-        # Safety check against garbage data
-        if length > 1024 * 1024: # Max 1MB per element to avoid DoS
+        if length > 1024 * 1024:
              raise ValueError("String size too large")
             
         string_val = bytes(self.data[self.pos:self.pos + length])
@@ -58,12 +55,11 @@ class BDecoder:
         try:
             return string_val.decode('utf-8')
         except UnicodeDecodeError:
-            return string_val.decode('latin-1') # Fallback
+            return string_val.decode('latin-1')
 
     def _parse_list(self):
-        # Format: l<elements>e
         lst = []
-        self.pos += 1 # skip 'l'
+        self.pos += 1
         while True:
             peek = self._peek().decode('latin-1', errors='ignore')
             if peek == 'e':
@@ -73,9 +69,8 @@ class BDecoder:
         return lst
 
     def _parse_dict(self):
-        # Format: d<key><value>...e
         dct = {}
-        self.pos += 1 # skip 'd'
+        self.pos += 1
         while True:
             peek = self._peek().decode('latin-1', errors='ignore')
             if peek == 'e':
@@ -83,7 +78,6 @@ class BDecoder:
                 break
             
             key = self._parse()
-            # Keys in torrent files must be strings
             if not isinstance(key, str):
                 raise ValueError(f"Expected string key in dict, found {type(key)}")
                 
@@ -95,18 +89,19 @@ class BDecoder:
 
 class TorrentEncoder:
     """
-    Recursive Bencoding Encoder
-    Encodes standard Python types into BitTorrent Binary format
+    Recursive Bencoding Encoder (Updated for str/bytes compatibility)
     """
     
     @staticmethod
     def encode(val):
         if isinstance(val, dict):
-            # Keys in torrents must be sorted alphabetically by byte value
-            items = sorted(val.items(), key=lambda item: item[0])
+            # Sort keys strictly by their UTF-8 byte representation
+            items = sorted(val.items(), key=lambda item: str(item[0]).encode('utf-8'))
             result = bytearray(b'd')
             for k, v in items:
-                result.extend(TorrentEncoder.encode(k))
+                # Force keys to bytes for strict compliance
+                k_bytes = k.encode('utf-8') if isinstance(k, str) else k
+                result.extend(TorrentEncoder.encode(k_bytes))
                 result.extend(TorrentEncoder.encode(v))
             result.extend(b'e')
             return bytes(result)
@@ -120,6 +115,10 @@ class TorrentEncoder:
         
         elif isinstance(val, int):
             return f'i{val}e'.encode()
+        
+        elif isinstance(val, str):
+            encoded = val.encode('utf-8')
+            return f'{len(encoded)}:'.encode() + encoded
         
         elif isinstance(val, bytes):
             return f'{len(val)}:'.encode() + val
