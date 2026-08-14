@@ -31,6 +31,7 @@ cd py-bittorrent-client
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install colorama requests
+```powershell
 
 Run Local Demo
 To simulate a full download session with mock data:
@@ -42,6 +43,8 @@ Provide a valid .torrent file path. The client will attempt to connect to the sw
 
 
 python main.py my-movie.torrent
+
+
 📂 Project Structure
 
 ├── core/                  # Core library modules
