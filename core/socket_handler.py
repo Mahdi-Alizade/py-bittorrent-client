@@ -6,7 +6,8 @@ from colorama import Fore, Style, init
 # اصلاح مسیرها برای اجرای مستقیم بدون ارور ایمپورت
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from network import NetworkProtocol
+# FIX: Changed import to absolute path
+from core.network import NetworkProtocol
 
 init(autoreset=True)
 
