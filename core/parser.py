@@ -91,3 +91,38 @@ class BDecoder:
             dct[key] = val
             
         return dct
+
+
+class TorrentEncoder:
+    """
+    Recursive Bencoding Encoder
+    Encodes standard Python types into BitTorrent Binary format
+    """
+    
+    @staticmethod
+    def encode(val):
+        if isinstance(val, dict):
+            # Keys in torrents must be sorted alphabetically by byte value
+            items = sorted(val.items(), key=lambda item: item[0])
+            result = bytearray(b'd')
+            for k, v in items:
+                result.extend(TorrentEncoder.encode(k))
+                result.extend(TorrentEncoder.encode(v))
+            result.extend(b'e')
+            return bytes(result)
+        
+        elif isinstance(val, list):
+            result = bytearray(b'l')
+            for item in val:
+                result.extend(TorrentEncoder.encode(item))
+            result.extend(b'e')
+            return bytes(result)
+        
+        elif isinstance(val, int):
+            return f'i{val}e'.encode()
+        
+        elif isinstance(val, bytes):
+            return f'{len(val)}:'.encode() + val
+        
+        else:
+            raise ValueError(f"Unsupported type for encoding: {type(val)}")
