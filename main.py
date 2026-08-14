@@ -3,8 +3,7 @@ from pathlib import Path
 from colorama import Fore, Style, init
 from core.parser import BDecoder
 from core.utils import calculate_info_hash
-from core.network import NetworkProtocol
-from core.protocol_messages import TorrentMessage
+from core.client_logic import BitTorrentClient
 
 # راه‌اندازی رنگ‌ها برای خروجی تمیز
 init(autoreset=True)
@@ -14,7 +13,7 @@ CLIENT_ID = "AvestaClient-0.1"
 
 def load_torrent(file_path: str):
     try:
-        print(f"{Fore.CYAN}[*] Reading torrent file: {file_path}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}[*] Loading torrent metadata: {file_path}{Style.RESET_ALL}")
         path_obj = Path(file_path)
         
         if not path_obj.exists():
@@ -24,71 +23,75 @@ def load_torrent(file_path: str):
         with open(path_obj, 'rb') as f:
             data = f.read()
 
-        print(f"{Fore.YELLOW}[*] Decoding Bencoded data...{Style.RESET_ALL}")
         decoder = BDecoder(data)
         metadata = decoder.decode()
         
+        print(f"{Fore.GREEN}[+] Metadata decoded successfully.{Style.RESET_ALL}")
         return metadata
 
     except Exception as e:
         print(f"{Fore.RED}[!] Failed to decode torrent: {e}{Style.RESET_ALL}")
         return None
 
-def analyze_metadata(metadata: dict):
+def run_download_session(metadata: dict, peer_ip: str, peer_port: int):
+    """
+    Main execution loop: Hash -> Connect -> Request -> Receive -> Verify -> Save
+    """
     if not metadata:
+        print(f"{Fore.RED}[-] No metadata to process.{Style.RESET_ALL}")
         return
 
     info_block = metadata.get(b'info') or metadata.get('info')
     if not info_block:
-        print(f"{Fore.RED}[!] Missing 'info' block.{Style.RESET_ALL}")
+        print(f"{Fore.RED}[-] Critical: Missing 'info' dictionary.{Style.RESET_ALL}")
         return
 
-    name = info_block.get(b'name') or info_block.get('name')
-    if isinstance(name, bytes):
-        name = name.decode('utf-8', errors='ignore')
-    
-    info_hash_hex = calculate_info_hash(info_block)
-    
-    print(f"\n{Fore.GREEN}{'='*40}\n{Fore.WHITE}SYSTEM STATUS ONLINE\n{Fore.GREEN}{'='*40}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}[-] Target : {name}")
-    print(f"{Fore.MAGENTA}[-] Hash   : {info_hash_hex}")
-    print(f"{Fore.GREEN}[+] Ready for Peer Connection.{Style.RESET_ALL}")
+    # 1. Calculate Hash
+    print(f"\n{Fore.YELLOW}[*] Calculating Swarm ID...{Style.RESET_ALL}")
+    try:
+        hash_hex = calculate_info_hash(info_block)
+    except Exception as e:
+        print(f"{Fore.RED}[-] Hash generation failed: {e}{Style.RESET_ALL}")
+        return
 
-def run_protocol_tests():
-    """
-    Verifies our custom protocol engine works correctly.
-    """
-    print(f"\n{Fore.LIGHTBLACK_EX}Running Internal Protocol Diagnostics...{Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}[-] Info Hash : {hash_hex}{Style.RESET_ALL}")
     
-    # Test 1: Generate Request
-    req_bytes = TorrentMessage.create_request(5, 0, 16384)
-    print(f"{Fore.CYAN}[*] Generated Request Packet Size: {len(req_bytes)} bytes")
+    # 2. Initialize Client
+    print(f"{Fore.LIGHTWHITE_EX}[+] Initializing Download Engine...{Style.RESET_ALL}")
+    client = BitTorrentClient(metadata)
     
-    # Test 2: Parse it back (Simulated loopback)
-    result = TorrentMessage.parse_piece(b'\x00\x00\x00\x0f\x07\x00\x00\x00\x00\x00\x00\x00\x00test_block_data')
-    if result:
-        idx, offset, data = result
-        print(f"{Fore.GREEN}[+] Piece Parser Verified: Index={idx}, Offset={offset}, DataLen={len(data)}{Style.RESET_ALL}")
+    # 3. Connect & Handshake
+    print(f"{Fore.CYAN}[*] Establishing P2P Session at {peer_ip}:{peer_port}...{Style.RESET_ALL}")
+    if client.connect_to_peer(peer_ip, int(peer_port), hash_hex, CLIENT_ID):
+        print(f"{Fore.GREEN}[+] Connection Secure.{Style.RESET_ALL}")
+        
+        # 4. Request & Download Cycle
+        print(f"{Fore.YELLOW}[*] Triggering Download Sequence...{Style.RESET_ALL}")
+        client.request_piece(0)
+        client.receive_and_process_pieces(timeout=5)
+        
+        # 5. Verify & Write to Disk
+        print(f"\n{Fore.GREEN}{'='*40}\n{Fore.WHITE}SESSION COMPLETE\n{Fore.GREEN}{'='*40}{Style.RESET_ALL}")
+        client.verify_integrity()
+        client.save_downloads()
     else:
-        print(f"{Fore.RED}[-] Test Failed{Style.RESET_ALL}")
+        print(f"{Fore.RED}[-] Handshake failed or peer unreachable.{Style.RESET_ALL}")
 
 def main():
     if len(sys.argv) < 2:
-        print(f"{Fore.RED}[!] Usage: python main.py <torrent_file> [--tests]{Style.RESET_ALL}")
+        print(f"[!] Usage: python main.py <torrent_file> [peer_ip] [peer_port]")
         sys.exit(1)
 
     target_file = sys.argv[1]
-    run_tests = "--tests" in sys.argv
+    peer_ip = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
+    peer_port = sys.argv[3] if len(sys.argv) > 3 else "6881"
     
-    print(f"{Fore.MAGENTA}Initializing Py-BitTorrent Client...{Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}Initializing Py-BitTorrent Client v0.2...{Style.RESET_ALL}")
     
-    raw_data = load_torrent(target_file)
-    analyze_metadata(raw_data)
+    metadata = load_torrent(target_file)
+    run_download_session(metadata, peer_ip, peer_port)
     
-    if run_tests:
-        run_protocol_tests()
-    
-    print(f"\n{Fore.GREEN}Execution Complete.{Style.RESET_ALL}")
+    print(f"\n{Fore.GREEN}Process Finished.{Style.RESET_ALL}")
     return 0
 
 if __name__ == "__main__":
@@ -96,5 +99,5 @@ if __name__ == "__main__":
         exit_code = main()
         sys.exit(exit_code)
     except KeyboardInterrupt:
-        print(f"\n{Fore.RED}Process interrupted by user.{Style.RESET_ALL}")
+        print(f"\n{Fore.RED}Interrupted by user.{Style.RESET_ALL}")
         sys.exit(1)
