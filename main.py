@@ -2,24 +2,14 @@ import sys
 from pathlib import Path
 from colorama import Fore, Style, init
 from core.parser import BDecoder
+from core.utils import calculate_info_hash
+from core.network import NetworkProtocol
 
 # راه‌اندازی رنگ‌ها برای خروجی تمیز
 init(autoreset=True)
 
-def get_key_safe(data: dict, target_key_str: str, default=None):
-    """
-    Finds a key in dictionary regardless of it being a string or bytes.
-    """
-    # Try as bytes first
-    key_bytes = target_key_str.encode('utf-8')
-    if key_bytes in data:
-        return data[key_bytes]
-    
-    # Try as string
-    if target_key_str in data:
-        return data[target_key_str]
-    
-    return default
+# Global Client Identifier (Must be <= 20 characters)
+CLIENT_ID = "AvestaClient-0.1"
 
 def load_torrent(file_path: str):
     try:
@@ -47,38 +37,39 @@ def analyze_metadata(metadata: dict):
     if not metadata:
         return
 
-    # --- DIAGNOSTIC LOG ---
-    print(f"\n{Fore.MAGENTA}[DIAG] Available Keys: {list(metadata.keys())}{Style.RESET_ALL}")
-    # ----------------------
+    print(f"\n{Fore.GREEN}{'='*40}\n{Fore.WHITE}METADATA ANALYSIS & NETWORK SETUP\n{Fore.GREEN}{'='*40}{Style.RESET_ALL}")
+    
+    # --- Step 1: Identify the File ---
+    info_block = metadata.get(b'info') or metadata.get('info')
+    if not info_block:
+        print(f"{Fore.RED}[!] Missing 'info' block. Cannot proceed.{Style.RESET_ALL}")
+        return
 
-    print(f"\n{Fore.GREEN}{'='*40}\n{Fore.WHITE}METADATA ANALYSIS\n{Fore.GREEN}{'='*40}{Style.RESET_ALL}")
+    name = info_block.get(b'name') or info_block.get('name')
+    if isinstance(name, bytes):
+        name = name.decode('utf-8', errors='ignore')
     
-    # Extract Announce using safe getter
-    announce = get_key_safe(metadata, 'announce', b'No URL')
-    # Convert bytes to string if necessary for display
-    announce_str = announce.decode('utf-8', errors='ignore') if isinstance(announce, bytes) else announce
-    print(f"{Fore.WHITE}[-] Tracker : {announce_str}")
+    print(f"{Fore.WHITE}[-] Target File : {name}")
+    
+    # --- Step 2: Calculate Info Hash ---
+    print(f"{Fore.YELLOW}[*] Calculating unique SWARM ID (Info Hash)...{Style.RESET_ALL}")
+    try:
+        info_hash_hex = calculate_info_hash(info_block)
+        print(f"{Fore.MAGENTA}[-] Info Hash   : {info_hash_hex}{Style.RESET_ALL}")
+        
+        # --- Step 3: Generate Handshake Payload ---
+        print(f"{Fore.GREEN}[*] Building Handshake Packet for Peer Connection...{Style.RESET_ALL}")
+        handshake_packet = NetworkProtocol.build_handshake(info_hash_hex, CLIENT_ID)
+        
+        print(f"{Fore.LIGHTWHITE_EX}[-] Packet Size : {len(handshake_packet)} bytes")
+        print(f"{Fore.LIGHTWHITE_EX}[-] Payload     : {handshake_packet[:20]}... {handshake_packet[-5:]}{Style.RESET_ALL}")
+        
+        print(f"\n{Fore.GREEN}System Ready: The handshake packet is now waiting in memory.{Style.RESET_ALL}")
 
-    # Extract Files and Info
-    # Info can also be nested inside meta-info-hash or just main keys
-    # Standard torrent has 'info' at the top level
-    
-    # Try getting 'info' from main metadata
-    info_raw = get_key_safe(metadata, 'info')
-    
-    if info_raw:
-        print(f"{Fore.WHITE}[-] Structure: Found 'info' block!")
-        
-        name = get_key_safe(info_raw, 'name', 'Unknown Name')
-        piece_len = get_key_safe(info_raw, 'piece length', 0)
-        
-        print(f"{Fore.WHITE}[-] Name    : {name}")
-        print(f"{Fore.WHITE}[-] Piece Len: {piece_len} bytes")
-    else:
-        print(f"{Fore.RED}[-] Critical Warning: No 'info' block found in metadata!{Style.RESET_ALL}")
+    except Exception as calc_err:
+        print(f"{Fore.RED}[!] Critical failure during hash generation: {calc_err}{Style.RESET_ALL}")
 
 def main():
-    """Main Entry Point"""
     if len(sys.argv) < 2:
         print(f"{Fore.RED}[!] Usage: python main.py <path_to_torrent_file>{Style.RESET_ALL}")
         sys.exit(1)
