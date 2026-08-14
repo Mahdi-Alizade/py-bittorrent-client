@@ -15,18 +15,26 @@ class BitTorrentClient:
     
     def __init__(self, torrent_metadata: dict):
         self.metadata = torrent_metadata
-        self.info_hash_hex = None # Will be populated via utils.calculate_info_hash
         
+        # FIX: Safe getter for handling both string and bytes keys
+        info_block = torrent_metadata.get(b'info') or torrent_metadata.get('info')
+        if not info_block:
+            raise ValueError("Invalid torrent metadata: Missing 'info' block")
+
+        # --- Intelligent Filename Extraction ---
+        raw_name = info_block.get(b'name') or info_block.get('name')
+        if isinstance(raw_name, bytes):
+            self.target_file_name = raw_name.decode('utf-8', errors='ignore')
+        elif isinstance(raw_name, str):
+            self.target_file_name = raw_name
+        else:
+            self.target_file_name = "UnknownFile"
+
         # In-memory buffer to collect downloaded pieces
         self.downloaded_pieces = {} 
         
         # Target output path
-        self.target_file_name = self._get_filename()
         self.output_path = Path("downloads") / self.target_file_name
-
-    def _get_filename(self) -> str:
-        info_block = self.metadata.get(b'info') or self.metadata.get('info')
-        return info_block.get(b'name').decode('utf-8', errors='ignore')
 
     def connect_to_peer(self, ip: str, port: int, hash_hex: str, peer_id: str) -> bool:
         """
