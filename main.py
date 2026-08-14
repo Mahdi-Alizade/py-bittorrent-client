@@ -6,6 +6,21 @@ from core.parser import BDecoder
 # راه‌اندازی رنگ‌ها برای خروجی تمیز
 init(autoreset=True)
 
+def get_key_safe(data: dict, target_key_str: str, default=None):
+    """
+    Finds a key in dictionary regardless of it being a string or bytes.
+    """
+    # Try as bytes first
+    key_bytes = target_key_str.encode('utf-8')
+    if key_bytes in data:
+        return data[key_bytes]
+    
+    # Try as string
+    if target_key_str in data:
+        return data[target_key_str]
+    
+    return default
+
 def load_torrent(file_path: str):
     try:
         print(f"{Fore.CYAN}[*] Reading torrent file: {file_path}{Style.RESET_ALL}")
@@ -32,35 +47,35 @@ def analyze_metadata(metadata: dict):
     if not metadata:
         return
 
+    # --- DIAGNOSTIC LOG ---
+    print(f"\n{Fore.MAGENTA}[DIAG] Available Keys: {list(metadata.keys())}{Style.RESET_ALL}")
+    # ----------------------
+
     print(f"\n{Fore.GREEN}{'='*40}\n{Fore.WHITE}METADATA ANALYSIS\n{Fore.GREEN}{'='*40}{Style.RESET_ALL}")
     
-    # Extract Announce
-    announce = metadata.get(b'announce', b'No URL').decode('utf-8', errors='ignore')
-    print(f"{Fore.WHITE}[-] Tracker : {announce}")
+    # Extract Announce using safe getter
+    announce = get_key_safe(metadata, 'announce', b'No URL')
+    # Convert bytes to string if necessary for display
+    announce_str = announce.decode('utf-8', errors='ignore') if isinstance(announce, bytes) else announce
+    print(f"{Fore.WHITE}[-] Tracker : {announce_str}")
 
-    # Extract Files
-    if 'info' in metadata:
-        info = metadata[b'info']
+    # Extract Files and Info
+    # Info can also be nested inside meta-info-hash or just main keys
+    # Standard torrent has 'info' at the top level
+    
+    # Try getting 'info' from main metadata
+    info_raw = get_key_safe(metadata, 'info')
+    
+    if info_raw:
+        print(f"{Fore.WHITE}[-] Structure: Found 'info' block!")
         
-        if 'name' in info:
-            name = info[b'name']
-            if isinstance(name, bytes):
-                name = name.decode('utf-8', errors='ignore')
-            print(f"{Fore.WHITE}[-] Name    : {name}")
-            
-        if 'piece length' in info:
-            piece_len = info[b'piece length']
-            print(f"{Fore.WHITE}[-] Piece Len: {piece_len} bytes")
-            
-        # Info Hash calculation (Real implementation requires hashing 'info' dict)
-        # We'll do this strictly in the future, but for now showing structure
-        info_hash_raw = metadata.get(b'meta-infohash', 'N/A') # Placeholder
-        print(f"{Fore.WHITE}[-] Status  : Metadata Loaded Successfully")
+        name = get_key_safe(info_raw, 'name', 'Unknown Name')
+        piece_len = get_key_safe(info_raw, 'piece length', 0)
+        
+        print(f"{Fore.WHITE}[-] Name    : {name}")
+        print(f"{Fore.WHITE}[-] Piece Len: {piece_len} bytes")
     else:
-        print(f"{Fore.YELLOW}[-] This looks like a multi-file torrent structure.")
-
-    # Print raw keys for debugging
-    # print(f"\nRaw Keys: {list(metadata.keys())}")
+        print(f"{Fore.RED}[-] Critical Warning: No 'info' block found in metadata!{Style.RESET_ALL}")
 
 def main():
     """Main Entry Point"""
