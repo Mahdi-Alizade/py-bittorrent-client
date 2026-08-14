@@ -6,16 +6,16 @@ class TorrentMessage:
     Implements BEP-3 Message formats.
     """
 
-    # Message Type IDs
-    CHOKED = b'\x00'
-    UNCHOKED = b'\x01'
-    INTERESTED = b'\x02'
-    NOT_INTERESTED = b'\x03'
-    HAVE = b'\x04'
-    BITFIELD = b'\x05'
-    REQUEST = b'\x06'
-    PIECE = b'\x07'
-    CANCEL = b'\x08'
+    # Raw integer IDs for easy comparison
+    MSG_CHOKED = 0
+    MSG_UNCHOKED = 1
+    MSG_INTERESTED = 2
+    MSG_NOT_INTERESTED = 3
+    MSG_HAVE = 4
+    MSG_BITFIELD = 5
+    MSG_REQUEST = 6
+    MSG_PIECE = 7
+    MSG_CANCEL = 8
 
     @staticmethod
     def create_request(piece_index: int, block_offset: int, block_length: int) -> bytes:
@@ -33,7 +33,7 @@ class TorrentMessage:
         length_prefix = struct.pack('>I', header_len)
         
         # Combine: Length + ID + Data
-        return length_prefix + TorrentMessage.REQUEST + payload
+        return length_prefix + TorrentMessage.MSG_REQUEST.to_bytes(1, 'big') + payload
 
     @staticmethod
     def parse_piece(data: bytes):
@@ -44,10 +44,11 @@ class TorrentMessage:
             if len(data) < 5: # Min length: 4 (prefix) + 1 (msg type)
                 raise ValueError("Data too short")
 
-            # Extract Message ID (byte index 4)
+            # Extract Message ID (byte index 4) - Returns Integer
             msg_id = data[4]
             
-            if msg_id != TorrentMessage.PIECE:
+            # FIX: Compare against integer directly
+            if msg_id != TorrentMessage.MSG_PIECE:
                 return None
 
             # Parse payload starting from index 5
@@ -72,4 +73,4 @@ class TorrentMessage:
         header_len = 1 + len(payload)
         length_prefix = struct.pack('>I', header_len)
         
-        return length_prefix + TorrentMessage.CANCEL + payload
+        return length_prefix + TorrentMessage.MSG_CANCEL.to_bytes(1, 'big') + payload
