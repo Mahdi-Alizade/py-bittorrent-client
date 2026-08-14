@@ -1,10 +1,13 @@
 import socket
 import sys
 from pathlib import Path
-from core.network import NetworkProtocol
-
-# Colorama setup
 from colorama import Fore, Style, init
+
+# اصلاح مسیرها برای اجرای مستقیم بدون ارور ایمپورت
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from network import NetworkProtocol
+
 init(autoreset=True)
 
 class PeerConnector:
