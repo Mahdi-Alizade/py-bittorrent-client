@@ -20,69 +20,44 @@ class TorrentMessage:
     @staticmethod
     def create_request(piece_index: int, block_offset: int, block_length: int) -> bytes:
         """
-        Creates a 'Request' message payload.
-        Client asks peer for a specific block of a piece.
-        
-        Args:
-            piece_index: ID of the piece (integer)
-            block_offset: Start position within the piece (integer)
-            block_length: Number of bytes requested (must be 16KB usually)
-            
-        Returns:
-            Byte array formatted exactly for BitTorrent transport
+        Creates a 'Request' message payload using Binary Struct packing.
+        Format: [4-byte Length][1-byte ID][4-byte Index][4-byte Offset][4-byte Length]
         """
-        # Format: [Length Prefix][ID][Index][Offset][Length]
-        # Using '>i' ensures network byte order (Big Endian) which is mandatory in BitTorrent
-        
-        msg_type = TorrentMessage.REQUEST
-        header_len = 1 + 12  # 1 byte ID + 12 bytes for 3 Integers
-        
-        # Pack the payload (12 bytes total for 3 integers)
+        # Pack the payload: Index, Offset, BlockLength
         payload = struct.pack('>III', piece_index, block_offset, block_length)
         
-        # Combine Length Prefix + ID + Payload
-        return f'{header_len}'.encode().encode() + msg_type + payload
+        # Total message size is ID (1) + Payload (12) = 13 bytes
+        header_len = 1 + len(payload)
+        
+        # Prefix must be 4-byte Big Integer per BEP-3
+        length_prefix = struct.pack('>I', header_len)
+        
+        # Combine: Length + ID + Data
+        return length_prefix + TorrentMessage.REQUEST + payload
 
     @staticmethod
     def parse_piece(data: bytes):
         """
         Parses an incoming 'Piece' message.
-        
-        Args:
-            data: Raw bytes received from socket
-            
-        Returns:
-            Tuple (piece_index, block_offset, block_data) or None
         """
         try:
-            # First 4 bytes are the Length Prefix of the payload
-            if len(data) < 4:
+            if len(data) < 5: # Min length: 4 (prefix) + 1 (msg type)
                 raise ValueError("Data too short")
 
-            payload_length = struct.unpack('>I', data[:4])[0]
-            
-            # Next 1 byte is Message ID (7 means PIECE)
+            # Extract Message ID (byte index 4)
             msg_id = data[4]
+            
             if msg_id != TorrentMessage.PIECE:
                 return None
 
-            # Remaining bytes form the piece structure: [Index][Offset][Block]
-            if len(data) < 4 + 1 + 8:
-                return None
-
-            # Skip length prefix and msg id, start reading from Index
-            rest_data = data[5:] 
+            # Parse payload starting from index 5
+            # Structure: [4 bytes Index][4 bytes Offset][Remaining Data]
+            idx = struct.unpack('>I', data[5:9])[0]
+            offset = struct.unpack('>I', data[9:13])[0]
             
-            # First 4 bytes: Piece Index
-            piece_index = struct.unpack('>I', rest_data[:4])[0]
+            block_data = data[13:]
             
-            # Next 4 bytes: Block Offset
-            block_offset = struct.unpack('>I', rest_data[4:8])[0]
-            
-            # The rest: Actual Block Data
-            block_data = rest_data[8:]
-            
-            return piece_index, block_offset, block_data
+            return idx, offset, block_data
 
         except Exception as e:
             print(f"[!] Error parsing piece: {e}")
@@ -92,10 +67,9 @@ class TorrentMessage:
     def create_cancel(piece_index: int, block_offset: int, block_length: int) -> bytes:
         """
         Cancels a previously sent request.
-        Used for flow control or switching priorities.
         """
-        msg_type = TorrentMessage.CANCEL
-        header_len = 1 + 12 
-        
         payload = struct.pack('>III', piece_index, block_offset, block_length)
-        return f'{header_len}'.encode().encode() + msg_type + payload
+        header_len = 1 + len(payload)
+        length_prefix = struct.pack('>I', header_len)
+        
+        return length_prefix + TorrentMessage.CANCEL + payload
