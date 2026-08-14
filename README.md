@@ -31,3 +31,28 @@ cd py-bittorrent-client
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install colorama requests
+
+Run Local Demo
+To simulate a full download session with mock data:
+
+
+python main.py data/sample.txt.torrent --tests
+Real-world Torrents
+Provide a valid .torrent file path. The client will attempt to connect to the swarm via the embedded Tracker URL.
+
+
+python main.py my-movie.torrent
+📂 Project Structure
+
+├── core/                  # Core library modules
+│   ├── __init__.py
+│   ├── parser.py          # Bencoding logic
+│   ├── protocol_messages.py # BEP-03 Message formats
+│   ├── socket_handler.py  # TCP Handshake logic
+│   ├── piece_manager.py   # Download assembly
+│   └── tracker_client.py  # Tracker API communication
+├── downloads/             # Output directory
+├── main.py                # Application entrypoint
+└── README.md              # This file
+⚙️ License
+MIT
