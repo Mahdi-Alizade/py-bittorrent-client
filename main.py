@@ -5,6 +5,7 @@ from core.parser import BDecoder
 from core.utils import calculate_info_hash
 from core.client_logic import BitTorrentClient
 from core.protocol_messages import TorrentMessage
+from core.tracker_client import TrackerClient
 
 # راه‌اندازی رنگ‌ها برای خروجی تمیز
 init(autoreset=True)
@@ -33,41 +34,34 @@ def load_torrent(file_path: str):
         print(f"{Fore.RED}[!] Failed to decode torrent: {e}{Style.RESET_ALL}")
         return None
 
-def run_download_session(metadata: dict, peer_ip: str, peer_port: int):
+def contact_tracker(metadata: dict):
     """
-    Main execution loop: Hash -> Connect -> Request -> Receive -> Verify -> Save
+    Connects to a public tracker to fetch peer IPs.
     """
     if not metadata:
         return
-
+    
     info_block = metadata.get(b'info') or metadata.get('info')
-    if not info_block:
-        print(f"{Fore.RED}[-] Critical: Missing 'info' dictionary.{Style.RESET_ALL}")
-        return
-
-    print(f"\n{Fore.YELLOW}[*] Calculating Swarm ID...{Style.RESET_ALL}")
-    try:
-        hash_hex = calculate_info_hash(info_block)
-    except Exception as e:
-        print(f"{Fore.RED}[-] Hash generation failed: {e}{Style.RESET_ALL}")
-        return
-
-    print(f"{Fore.MAGENTA}[-] Info Hash : {hash_hex}{Style.RESET_ALL}")
-    print(f"{Fore.LIGHTWHITE_EX}[+] Initializing Download Engine...{Style.RESET_ALL}")
+    announce = metadata.get(b'announce') or metadata.get('announce')
     
-    client = BitTorrentClient(metadata)
-    
-    print(f"{Fore.CYAN}[*] Establishing P2P Session at {peer_ip}:{peer_port}...{Style.RESET_ALL}")
-    if client.connect_to_peer(peer_ip, int(peer_port), hash_hex, CLIENT_ID):
-        print(f"{Fore.GREEN}[+] Connection Secure.{Style.RESET_ALL}")
-        client.request_piece(0)
-        client.receive_and_process_pieces(timeout=5)
+    if isinstance(announce, bytes):
+        announce = announce.decode('utf-8', errors='ignore')
         
-        print(f"\n{Fore.GREEN}{'='*40}\n{Fore.WHITE}SESSION COMPLETE\n{Fore.GREEN}{'='*40}{Style.RESET_ALL}")
-        client.verify_integrity()
-        client.save_downloads()
-    else:
-        print(f"{Fore.RED}[-] Handshake failed or peer unreachable.{Style.RESET_ALL}")
+    if not announce:
+        print(f"{Fore.RED}[-] No announce URL found in torrent.{Style.RESET_ALL}")
+        return
+
+    hash_hex = calculate_info_hash(info_block)
+    tracker = TrackerClient(hash_hex, CLIENT_ID)
+    
+    # Test with a real public tracker
+    result = tracker.announce(announce)
+    
+    if result:
+        print(f"\n{Fore.GREEN}{'='*40}\n{Fore.WHITE}TRACKER RESPONSE\n{Fore.GREEN}{'='*40}{Style.RESET_ALL}")
+        print(f"[+] Complete Seeds : {result.get('complete')}")
+        print(f"[+] Incomplete Leeches: {result.get('incomplete')}")
+        print(f"[+] Peer Data Length : {len(result.get('peers_raw', ''))}")
 
 def run_protocol_tests():
     """Verifies our custom protocol engine works correctly."""
@@ -88,18 +82,14 @@ def main():
         print(f"[!] Usage: python main.py <torrent_file> [peer_ip] [peer_port]")
         sys.exit(1)
 
-    # FIX: Clean arguments to avoid flags like '--tests' being parsed as IP
     clean_args = [arg for arg in sys.argv[2:] if not arg.startswith("--")]
-    
     target_file = sys.argv[1]
-    peer_ip = clean_args[0] if len(clean_args) > 0 else "127.0.0.1"
-    peer_port = clean_args[1] if len(clean_args) > 1 else "6881"
     run_tests_mode = "--tests" in sys.argv
     
-    print(f"{Fore.MAGENTA}Initializing Py-BitTorrent Client v0.3...{Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}Initializing Py-BitTorrent Client v0.4...{Style.RESET_ALL}")
     
     metadata = load_torrent(target_file)
-    run_download_session(metadata, peer_ip, peer_port)
+    contact_tracker(metadata)
     
     if run_tests_mode:
         run_protocol_tests()
