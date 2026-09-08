@@ -1,58 +1,66 @@
+import argparse
+import hashlib
+import os
+import random
+import string
 import sys
 from pathlib import Path
 from colorama import Fore, Style, init
-from core.parser import BDecoder
-from core.utils import calculate_info_hash
+
 from core.client_logic import BitTorrentClient
-from core.protocol_messages import TorrentMessage
-from core.tracker_client import TrackerClient
+from core.parser import BDecoder, TorrentEncoder
 
 init(autoreset=True)
-CLIENT_ID = "AvestaClient-0.1"
 
-def load_torrent(path: str):
-    try:
-        print(f"{Fore.CYAN}[*] Loading torrent: {path}{Style.RESET_ALL}")
-        with open(path, 'rb') as f:
-            meta = BDecoder(f.read()).decode()
-        print(f"{Fore.GREEN}[+] OK{Style.RESET_ALL}")
-        return meta
-    except Exception as e:
-        print(f"{Fore.RED}[-] Failed: {e}{Style.RESET_ALL}")
-        return None
 
-def run_tests():
-    print(f"\n{Fore.LIGHTBLACK_EX}Running Diagnostics...{Style.RESET_ALL}")
-    pkt = TorrentMessage.create_request(0, 0, 16384)
-    print(f"[+] Packet Size: {len(pkt)} bytes")
-    res = TorrentMessage.parse_piece(b'\x00\x00\x00\x0f\x07\x00\x00\x00\x00\x00\x00\x00\x00test_block_data')
-    if res:
-        print(f"{Fore.GREEN}[+] Parser Verified.{Style.RESET_ALL}")
+def generate_peer_id() -> bytes:
+    """Generates a standard 20-byte client identifier: -PY0001-xxxxxxxxxxxx"""
+    random_digits = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+    return f"-PY0001-{random_digits}".encode("ascii")
+
+
+def calculate_info_hash(info_dict: dict) -> bytes:
+    """Computes exact 20-byte SHA-1 hash of the bencoded info dictionary."""
+    encoded_info = TorrentEncoder.encode(info_dict)
+    return hashlib.sha1(encoded_info).digest()
+
 
 def main():
-    if len(sys.argv) < 2:
-        print(f"[!] Usage: python main.py <torrent_file>")
-        return
+    parser = argparse.ArgumentParser(description="Py-BitTorrent Client Engine from scratch.")
+    parser.add_argument("torrent_path", help="Path to the .torrent file.")
+    parser.add_argument("--max-peers", type=int, default=10, help="Max peers to contact concurrently.")
+    args = parser.parse_args()
 
-    clean_args = [a for a in sys.argv[2:] if not a.startswith("--")]
-    target = sys.argv[1]
-    do_tests = "--tests" in sys.argv
+    torrent_file = Path(args.torrent_path)
+    if not torrent_file.exists():
+        print(f"{Fore.RED}[-] Torrent file not found: {torrent_file}{Style.RESET_ALL}")
+        sys.exit(1)
 
-    print(f"{Fore.MAGENTA}Initializing Py-BitTorrent Client v0.5...{Style.RESET_ALL}")
-    meta = load_torrent(target)
-    
-    if meta:
-        info = meta.get(b'info') or meta.get('info')
-        h = calculate_info_hash(info)
-        print(f"Hash: {h}")
-        
-        client = BitTorrentClient(meta)
-        client.start_download_loop(h, CLIENT_ID)
+    print(f"{Fore.CYAN}=== Py-BitTorrent Client ==={Style.RESET_ALL}")
+    print(f"[*] Reading torrent file: {torrent_file.name}")
 
-    if do_tests:
-        run_tests()
-        
-    print(f"\n{Fore.GREEN}Done.{Style.RESET_ALL}")
+    try:
+        raw_torrent_data = torrent_file.read_bytes()
+        metadata = BDecoder(raw_torrent_data).decode()
+    except Exception as e:
+        print(f"{Fore.RED}[-] Failed to parse torrent metainfo: {e}{Style.RESET_ALL}")
+        sys.exit(1)
+
+    info = metadata.get(b"info") or metadata.get("info")
+    if not info:
+        print(f"{Fore.RED}[-] Malformed torrent: missing info dictionary{Style.RESET_ALL}")
+        sys.exit(1)
+
+    info_hash = calculate_info_hash(info)
+    peer_id = generate_peer_id()
+
+    print(f"{Fore.GREEN}[+] Torrent parsed successfully!{Style.RESET_ALL}")
+    print(f"[*] Info Hash (Hex): {info_hash.hex()}")
+    print(f"[*] Peer ID: {peer_id.decode('latin-1', errors='replace')}")
+
+    client = BitTorrentClient(metadata)
+    client.start_download_loop(raw_info_hash=info_hash, my_peer_id=peer_id, max_peers=args.max_peers)
+
 
 if __name__ == "__main__":
     main()
