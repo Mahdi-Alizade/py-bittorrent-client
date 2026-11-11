@@ -40,3 +40,35 @@ class TestDownloadSession:
         session.receive_block(0, 0, payload)
         # SHA1 mismatch should return False
         assert session.verify_and_save_piece(0) is False
+
+    def test_multi_file_session_integration(self, tmp_path):
+        # Two files: 100 bytes and 100 bytes = 200 bytes total, 1 piece of 200 bytes
+        payload = b"M" * 200
+        piece_hash = hashlib.sha1(payload).digest()
+
+        file_entries = [
+            {"length": 100, "path": ["file1.txt"]},
+            {"length": 100, "path": ["sub", "file2.txt"]}
+        ]
+
+        session = DownloadSession(
+            filename="torrent_dir",
+            piece_length=200,
+            piece_hashes=[piece_hash],
+            file_entries=file_entries,
+            output_dir=str(tmp_path)
+        )
+
+        assert session.is_multi_file is True
+        assert session.initialize_file() is True
+
+        session.receive_block(0, 0, payload)
+        assert session.verify_and_save_piece(0) is True
+
+        file1 = tmp_path / "torrent_dir" / "file1.txt"
+        file2 = tmp_path / "torrent_dir" / "sub" / "file2.txt"
+
+        assert file1.exists()
+        assert file1.read_bytes() == b"M" * 100
+        assert file2.exists()
+        assert file2.read_bytes() == b"M" * 100
