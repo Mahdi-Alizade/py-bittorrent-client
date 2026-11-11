@@ -4,13 +4,15 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from colorama import Fore, Style, init
 
+from core.multi_file_storage import MultiFileStorageManager
+
 init(autoreset=True)
 
 
 class DownloadSession:
     """
     Manages piece verification via SHA-1 and random-access persistent writes.
-    Uses seek-based I/O to guarantee data is placed at correct offsets regardless of arrival order.
+    Supports both Single-File and Multi-File BitTorrent structures seamlessly.
     """
 
     def __init__(
@@ -19,6 +21,7 @@ class DownloadSession:
         piece_length: int,
         total_length: Optional[int] = None,
         piece_hashes: Optional[List[bytes]] = None,
+        file_entries: Optional[List[Dict]] = None,
         output_dir: str = "downloads"
     ):
         self.filename = filename
@@ -27,6 +30,17 @@ class DownloadSession:
         self.piece_hashes = piece_hashes or []
         self.output_dir = Path(output_dir)
         self.final_path = self.output_dir / self.filename
+
+        # Multi-file storage manager if file list is provided
+        self.file_entries = file_entries or []
+        self.is_multi_file = len(self.file_entries) > 0
+
+        if self.is_multi_file:
+            target_base_dir = self.output_dir / self.filename
+            self.multi_storage = MultiFileStorageManager(target_base_dir, self.file_entries)
+            self.total_length = self.multi_storage.total_length
+        else:
+            self.multi_storage = None
 
         # Buffer: {piece_idx: bytearray}
         self.pending_blocks: Dict[int, bytearray] = {}
@@ -37,6 +51,12 @@ class DownloadSession:
         """Pre-allocates the file space on disk matching total expected size."""
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
+
+            if self.is_multi_file and self.multi_storage is not None:
+                print(f"{Fore.CYAN}[*] Pre-allocating multi-file structure in: {self.final_path.name}...{Style.RESET_ALL}")
+                self.multi_storage.initialize_storage()
+                return True
+
             if not self.final_path.exists() or self.final_path.stat().st_size != self.total_length:
                 print(f"{Fore.CYAN}[*] Pre-allocating {self.final_path.name} ({self.total_length} bytes)...{Style.RESET_ALL}")
                 with open(self.final_path, "wb") as f:
@@ -82,16 +102,23 @@ class DownloadSession:
                 del self.pending_blocks[piece_index]
                 return False
 
-        # Seek-based write to correct file offset
         target_offset = piece_index * self.piece_length
+
         try:
-            with open(self.final_path, "r+b") as f:
-                f.seek(target_offset)
-                f.write(piece_bytes)
+            if self.is_multi_file and self.multi_storage is not None:
+                write_ok = self.multi_storage.write_piece(target_offset, piece_bytes)
+                if not write_ok:
+                    print(f"{Fore.RED}[-] Multi-file write incomplete for piece #{piece_index}{Style.RESET_ALL}")
+                    return False
+            else:
+                with open(self.final_path, "r+b") as f:
+                    f.seek(target_offset)
+                    f.write(piece_bytes)
 
             del self.pending_blocks[piece_index]
             self.completed_pieces.append(piece_index)
             return True
+
         except IOError as e:
             print(f"{Fore.RED}[-] Write error on piece #{piece_index}: {e}{Style.RESET_ALL}")
             return False
