@@ -1,7 +1,8 @@
-import math
 from typing import Dict, List, Optional, Tuple
 from colorama import Fore, Style, init
 
+from core.block_picker import BlockState, PieceBlockTracker
+from core.piece_selector import RarestFirstSelector
 from core.protocol_messages import TorrentMessage
 from core.reassemble import DownloadSession
 
@@ -10,48 +11,73 @@ init(autoreset=True)
 
 class PieceManager:
     """
-    Coordinates downloading, block tracking, SHA-1 verification, and disk writes.
-    Handles variable piece sizes (especially the last truncated piece).
+    Coordinates piece downloading, block pipelining, and rarest-first selection.
     """
 
-    def __init__(self, filename: str, piece_length: int, num_pieces: int, total_length: Optional[int] = None):
+    def __init__(
+        self,
+        filename: str,
+        piece_length: int,
+        num_pieces: int,
+        total_length: Optional[int] = None
+    ):
         self.filename = filename
         self.piece_length = piece_length
         self.num_pieces = num_pieces
-        self.total_length = total_length or (piece_length * num_pieces)
-        self.block_size = 16 * 1024  # Standard 16 KB block size
 
-        # Bitfield tracking
-        self.peer_bitfield: List[bool] = [False] * num_pieces
-        self.have_pieces: List[bool] = [False] * num_pieces
+        if total_length is not None:
+            self.total_length = total_length
+        else:
+            self.total_length = piece_length * num_pieces
 
-        # Active block storage: {(piece_idx, offset): block_data}
-        self.received_blocks: Dict[Tuple[int, int], bytes] = {}
+        self.block_size = 16 * 1024
 
-        # Disk Session writer
-        self.writer = DownloadSession(filename, piece_length)
+        # Rarest-first selector
+        self.selector = RarestFirstSelector(total_pieces=num_pieces)
+
+        # Per-piece block trackers
+        self.trackers: Dict[int, PieceBlockTracker] = {}
+        self._initialize_trackers()
+
+        # Storage writer session
+        self.writer = DownloadSession(filename, piece_length, total_length=self.total_length)
         self.writer.initialize_file()
 
+        # Tracking completed status
+        self.have_pieces: List[bool] = [False] * num_pieces
+
+    def _initialize_trackers(self):
+        for piece_idx in range(self.num_pieces):
+            piece_size = self.get_piece_size(piece_idx)
+            tracker = PieceBlockTracker(
+                piece_index=piece_idx,
+                piece_size=piece_size,
+                standard_block_size=self.block_size
+            )
+            self.trackers[piece_idx] = tracker
+
     def get_piece_size(self, piece_idx: int) -> int:
-        """Calculates actual size of a piece, accounting for the last truncated piece."""
         if piece_idx < self.num_pieces - 1:
             return self.piece_length
-        remainder = self.total_length % self.piece_length
-        return remainder if remainder > 0 else self.piece_length
 
-    def get_blocks_for_piece(self, piece_idx: int) -> List[Tuple[int, int]]:
-        """Returns list of (offset, length) tuples for all blocks in a piece."""
-        size = self.get_piece_size(piece_idx)
-        blocks = []
-        offset = 0
-        while offset < size:
-            length = min(self.block_size, size - offset)
-            blocks.append((offset, length))
-            offset += length
-        return blocks
+        remainder = self.total_length % self.piece_length
+        if remainder > 0:
+            return remainder
+        return self.piece_length
+
+    def register_peer(self, peer_id: str):
+        self.selector.register_peer(peer_id)
+
+    def unregister_peer(self, peer_id: str):
+        self.selector.unregister_peer(peer_id)
+
+    def handle_peer_have(self, peer_id: str, piece_idx: int):
+        self.selector.record_peer_have(peer_id, piece_idx)
+
+    def handle_peer_bitfield(self, peer_id: str, bitfield_bytes: bytes):
+        self.selector.record_peer_bitfield(peer_id, bitfield_bytes)
 
     def handle_message(self, raw_data: bytes):
-        """Dispatches incoming peer protocol messages."""
         if len(raw_data) < 5:
             return
 
@@ -59,53 +85,62 @@ class PieceManager:
 
         if msg_id == TorrentMessage.MSG_PIECE:
             parsed = TorrentMessage.parse_piece(raw_data)
-            if parsed:
-                idx, offset, data = parsed
-                self._store_block(idx, offset, data)
-
-        elif msg_id == TorrentMessage.MSG_HAVE:
-            piece_idx = TorrentMessage.parse_have(raw_data)
-            if piece_idx is not None and piece_idx < self.num_pieces:
-                self.peer_bitfield[piece_idx] = True
-                print(f"{Fore.CYAN}[<-] Peer HAS Piece #{piece_idx}{Style.RESET_ALL}")
+            if parsed is not None:
+                piece_idx, offset, block_data = parsed
+                self._store_block(piece_idx, offset, block_data)
 
     def _store_block(self, piece_idx: int, offset: int, block_data: bytes):
-        """Stores received block and triggers integrity verification when all blocks arrive."""
-        self.received_blocks[(piece_idx, offset)] = block_data
-        self.writer.receive_block(piece_idx, offset, block_data)
-        self._verify_piece_integrity(piece_idx)
+        if piece_idx not in self.trackers:
+            return
 
-    def _verify_piece_integrity(self, piece_idx: int):
-        """Verifies all blocks for piece_idx exist and commits to disk session."""
-        expected_blocks = self.get_blocks_for_piece(piece_idx)
-        received_offsets = {off for (p, off) in self.received_blocks.keys() if p == piece_idx}
-        expected_offsets = {off for (off, _) in expected_blocks}
+        tracker = self.trackers[piece_idx]
+        marked = tracker.mark_block_received(offset)
 
-        if expected_offsets.issubset(received_offsets):
-            print(f"{Fore.MAGENTA}[*] Full piece #{piece_idx} assembled. Writing to disk...{Style.RESET_ALL}")
-            self.writer.verify_and_save_piece(piece_idx)
-            self.have_pieces[piece_idx] = True
+        if marked:
+            self.writer.receive_block(piece_idx, offset, block_data)
 
-            # Clean stored blocks for this piece
-            keys_to_delete = [k for k in self.received_blocks if k[0] == piece_idx]
-            for k in keys_to_delete:
-                del self.received_blocks[k]
+        if tracker.is_piece_complete():
+            is_valid = self.writer.verify_and_save_piece(piece_idx)
+            if is_valid:
+                self.have_pieces[piece_idx] = True
+                self.selector.mark_piece_completed(piece_idx)
+                print(f"{Fore.GREEN}[+] SUCCESS: Piece #{piece_idx} validated and saved.{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.RED}[-] Piece #{piece_idx} verification failed. Resetting blocks.{Style.RESET_ALL}")
+                for b in tracker.blocks:
+                    b.reset()
+                self.selector.mark_piece_failed(piece_idx)
 
-            print(f"{Fore.GREEN}[+] SUCCESS: Piece #{piece_idx} saved successfully.{Style.RESET_ALL}")
+    def get_next_request_for_peer(self, peer_id: str) -> Optional[bytes]:
+        """
+        Gets next block request payload for a specific peer:
+        1. Look for existing in-progress pieces that have pending blocks
+        2. Otherwise, pick the rarest available piece from this peer
+        """
+        # First priority: complete pieces already in progress
+        for piece_idx in list(self.selector.in_progress_pieces):
+            if piece_idx in self.selector.peer_inventory.get(peer_id, set()):
+                tracker = self.trackers[piece_idx]
+                block = tracker.get_next_pending_block()
+                if block is not None:
+                    block.mark_requested()
+                    return TorrentMessage.create_request(piece_idx, block.block_offset, block.block_length)
 
-    def get_next_request(self, piece_idx: int) -> Optional[bytes]:
-        """Finds the next unreceived block in piece_idx and constructs a BEP-3 Request packet."""
-        if self.have_pieces[piece_idx]:
-            return None
+        # Second priority: pick a new rarest piece
+        chosen_piece = self.selector.pick_next_piece(peer_id)
+        if chosen_piece is not None:
+            tracker = self.trackers[chosen_piece]
+            block = tracker.get_next_pending_block()
+            if block is not None:
+                block.mark_requested()
+                return TorrentMessage.create_request(chosen_piece, block.block_offset, block.block_length)
 
-        blocks = self.get_blocks_for_piece(piece_idx)
-        for offset, length in blocks:
-            if (piece_idx, offset) not in self.received_blocks:
-                return TorrentMessage.create_request(piece_idx, offset, length)
         return None
 
     def status_report(self) -> str:
-        """Returns completed pieces count and percentage."""
-        total_downloaded = sum(1 for p in self.have_pieces if p)
-        pct = (total_downloaded / self.num_pieces * 100) if self.num_pieces > 0 else 0.0
-        return f"{total_downloaded}/{self.num_pieces} ({pct:.1f}%)"
+        completed_count = sum(1 for status in self.have_pieces if status)
+        if self.num_pieces > 0:
+            percentage = (completed_count / self.num_pieces) * 100.0
+        else:
+            percentage = 0.0
+        return f"{completed_count}/{self.num_pieces} ({percentage:.1f}%)"
