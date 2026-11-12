@@ -29,14 +29,17 @@ def calculate_info_hash(info_dict: dict) -> bytes:
 def main():
     parser = argparse.ArgumentParser(description="Py-BitTorrent Client Engine.")
     parser.add_argument("target", help="Path to a .torrent file or a magnet:? URI.")
-    parser.add_argument("--max-peers", type=int, default=15, help="Max peers to contact concurrently.")
+    parser.add_argument("--max-peers", type=int, default=25, help="Max peers to contact concurrently.")
+    parser.add_argument("--no-dht", action="store_true", help="Disable decentralized Kademlia DHT peer discovery.")
     args = parser.parse_args()
 
     target_input = args.target.strip()
     peer_id = generate_peer_id()
+    use_dht = not args.no_dht
 
     print(f"{Fore.CYAN}=== Py-BitTorrent Client ==={Style.RESET_ALL}")
     print(f"[*] Peer ID: {peer_id.decode('latin-1', errors='replace')}")
+    print(f"[*] Kademlia DHT: {'ENABLED' if use_dht else 'DISABLED'}")
 
     if target_input.startswith("magnet:?"):
         try:
@@ -51,7 +54,11 @@ def main():
         print(f"[*] Info Hash (Hex): {info_hash.hex()}")
 
         metadata = asyncio.run(
-            BitTorrentClient.fetch_metadata_from_magnet(magnet_data, peer_id)
+            BitTorrentClient.fetch_metadata_from_magnet(
+                magnet_data,
+                peer_id,
+                use_dht=use_dht
+            )
         )
         if not metadata:
             print(f"{Fore.RED}[-] Could not fetch torrent metadata from swarm peers.{Style.RESET_ALL}")
@@ -80,7 +87,7 @@ def main():
         print(f"{Fore.GREEN}[+] Torrent parsed successfully!{Style.RESET_ALL}")
         print(f"[*] Info Hash (Hex): {info_hash.hex()}")
 
-    client = BitTorrentClient(metadata)
+    client = BitTorrentClient(metadata, enable_dht=use_dht)
     client.start_download_loop(raw_info_hash=info_hash, my_peer_id=peer_id, max_peers=args.max_peers)
 
 
