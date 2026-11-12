@@ -1,5 +1,4 @@
 import hashlib
-import os
 from pathlib import Path
 from typing import Dict, List, Optional
 from colorama import Fore, Style, init
@@ -11,7 +10,7 @@ init(autoreset=True)
 
 class DownloadSession:
     """
-    Manages piece verification via SHA-1 and random-access persistent writes.
+    Manages piece verification via SHA-1 and random-access persistent writes and reads.
     Supports both Single-File and Multi-File BitTorrent structures seamlessly.
     """
 
@@ -31,7 +30,6 @@ class DownloadSession:
         self.output_dir = Path(output_dir)
         self.final_path = self.output_dir / self.filename
 
-        # Multi-file storage manager if file list is provided
         self.file_entries = file_entries or []
         self.is_multi_file = len(self.file_entries) > 0
 
@@ -42,13 +40,11 @@ class DownloadSession:
         else:
             self.multi_storage = None
 
-        # Buffer: {piece_idx: bytearray}
         self.pending_blocks: Dict[int, bytearray] = {}
         self.completed_pieces: List[int] = []
         self.total_data_received = 0
 
     def initialize_file(self) -> bool:
-        """Pre-allocates the file space on disk matching total expected size."""
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -73,7 +69,6 @@ class DownloadSession:
         return min(self.piece_length, max(0, self.total_length - start_offset))
 
     def receive_block(self, piece_index: int, block_offset: int, block_data: bytes):
-        """Places block into memory buffer for piece_index."""
         if piece_index not in self.pending_blocks:
             expected_size = self.get_piece_size(piece_index)
             self.pending_blocks[piece_index] = bytearray(expected_size)
@@ -84,16 +79,11 @@ class DownloadSession:
         self.total_data_received += len(block_data)
 
     def verify_and_save_piece(self, piece_index: int) -> bool:
-        """
-        Validates the assembled piece using SHA-1 (if hashes are provided)
-        and writes it at (piece_index * piece_length) on disk.
-        """
         if piece_index not in self.pending_blocks:
             return False
 
         piece_bytes = bytes(self.pending_blocks[piece_index])
 
-        # Verify SHA-1 hash if available
         if piece_index < len(self.piece_hashes):
             expected_hash = self.piece_hashes[piece_index]
             calculated_hash = hashlib.sha1(piece_bytes).digest()
@@ -122,6 +112,38 @@ class DownloadSession:
         except IOError as e:
             print(f"{Fore.RED}[-] Write error on piece #{piece_index}: {e}{Style.RESET_ALL}")
             return False
+
+    def read_block(self, piece_index: int, block_offset: int, block_length: int) -> Optional[bytes]:
+        """
+        Reads a verified block from disk storage for uploading/seeding to peers.
+        """
+        if block_length <= 0 or block_length > 65536:
+            return None
+
+        piece_size = self.get_piece_size(piece_index)
+        if block_offset < 0 or (block_offset + block_length) > piece_size:
+            return None
+
+        global_offset = (piece_index * self.piece_length) + block_offset
+
+        try:
+            if self.is_multi_file and self.multi_storage is not None:
+                data = self.multi_storage.read_piece(global_offset, block_length)
+                if len(data) == block_length:
+                    return data
+                return None
+
+            if not self.final_path.exists():
+                return None
+
+            with open(self.final_path, "rb") as f:
+                f.seek(global_offset)
+                data = f.read(block_length)
+                if len(data) == block_length:
+                    return data
+                return None
+        except IOError:
+            return None
 
     def get_status(self) -> dict:
         return {
