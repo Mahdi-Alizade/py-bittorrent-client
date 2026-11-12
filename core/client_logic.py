@@ -13,7 +13,7 @@ init(autoreset=True)
 class BitTorrentClient:
     """
     Asynchronous BitTorrent client orchestrating parallel peer workers,
-    pipelined block downloads, and rarest-first piece scheduling.
+    pipelined block downloads, rarest-first scheduling, and End-Game mode.
     """
 
     def __init__(self, torrent_metadata: dict):
@@ -23,7 +23,6 @@ class BitTorrentClient:
         if not self.info_block:
             raise ValueError("Invalid torrent metadata: Missing 'info' dictionary")
 
-        # Extract target filename or root folder name
         raw_name = self.info_block.get(b"name") or self.info_block.get("name")
         if isinstance(raw_name, bytes):
             self.target_filename = raw_name.decode("utf-8", errors="ignore")
@@ -36,7 +35,6 @@ class BitTorrentClient:
             self.info_block.get(b"piece length") or self.info_block.get("piece length", 16384)
         )
 
-        # Extract file entries for multi-file torrents if present
         self.file_entries: List[Dict] = []
         raw_files = self.info_block.get(b"files") or self.info_block.get("files")
 
@@ -58,7 +56,6 @@ class BitTorrentClient:
         else:
             self.total_length = self.piece_length
 
-        # Extract 20-byte SHA-1 hashes for each piece
         raw_pieces = self.info_block.get(b"pieces") or self.info_block.get("pieces", b"")
         if isinstance(raw_pieces, str):
             raw_pieces = raw_pieces.encode("latin-1")
@@ -71,6 +68,9 @@ class BitTorrentClient:
             self.num_pieces = len(self.piece_hashes)
         else:
             self.num_pieces = 1
+
+        # Registry of live peer connections for End-Game cancel dispatches
+        self.active_connections: Dict[str, AsyncPeerConnection] = {}
 
     async def _peer_worker(
         self,
@@ -88,6 +88,7 @@ class BitTorrentClient:
         if not connected:
             return
 
+        self.active_connections[peer_tag] = peer_conn
         manager.register_peer(peer_tag)
         print(f"{Fore.GREEN}[+] Worker active for peer {peer_tag}{Style.RESET_ALL}")
 
@@ -138,11 +139,16 @@ class BitTorrentClient:
                     manager.handle_peer_bitfield(peer_tag, bitfield_data)
 
                 elif msg_id == TorrentMessage.MSG_PIECE:
-                    manager.handle_message(raw_msg)
+                    cancel_tasks = manager.handle_message(raw_msg, source_peer_id=peer_tag)
+                    for target_peer, cancel_pkt in cancel_tasks:
+                        target_conn = self.active_connections.get(target_peer)
+                        if target_conn is not None:
+                            await target_conn.send_message(cancel_pkt)
 
         except Exception as err:
             print(f"{Fore.RED}[!] Peer worker error ({peer_tag}): {err}{Style.RESET_ALL}")
         finally:
+            self.active_connections.pop(peer_tag, None)
             manager.unregister_peer(peer_tag)
             await peer_conn.close()
 
@@ -204,7 +210,8 @@ class BitTorrentClient:
                 break
 
             await asyncio.sleep(1.0)
-            print(f"{Fore.CYAN}[*] Download Progress: {manager.status_report()}{Style.RESET_ALL}")
+            status_tag = " [END-GAME]" if manager.is_endgame_active() else ""
+            print(f"{Fore.CYAN}[*] Download Progress{status_tag}: {manager.status_report()}{Style.RESET_ALL}")
 
         for t in active_worker_tasks:
             if not t.done():
