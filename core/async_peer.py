@@ -1,16 +1,15 @@
 import asyncio
 import struct
-from typing import Optional, Tuple
-from colorama import Fore, Style
+from typing import Optional
 
-from core.protocol_messages import TorrentMessage
+from core.extension_protocol import ExtensionProtocol
 
 PROTOCOL_IDENTIFIER = b"BitTorrent protocol"
 
 
 class AsyncPeerConnection:
     """
-    Manages an asynchronous TCP connection and BEP-3 message loop for a single peer.
+    Manages an asynchronous TCP connection and BEP-3/BEP-10 message loop for a single peer.
     """
 
     def __init__(self, ip: str, port: int, info_hash: bytes, peer_id: bytes, timeout: float = 6.0):
@@ -24,6 +23,7 @@ class AsyncPeerConnection:
         self.writer: Optional[asyncio.StreamWriter] = None
         self.is_choked = True
         self.is_connected = False
+        self.supports_extensions = False
         self.peer_id_str = f"{ip}:{port}"
 
     async def connect_and_handshake(self) -> bool:
@@ -33,9 +33,8 @@ class AsyncPeerConnection:
             self.reader = reader
             self.writer = writer
 
-            # Build standard 68-byte handshake payload
             pstrlen = len(PROTOCOL_IDENTIFIER)
-            reserved = b"\x00" * 8
+            reserved = ExtensionProtocol.build_reserved_bytes()
             handshake_payload = struct.pack(
                 ">B19s8s20s20s",
                 pstrlen,
@@ -48,16 +47,17 @@ class AsyncPeerConnection:
             self.writer.write(handshake_payload)
             await self.writer.drain()
 
-            # Read exactly 68 bytes response
             read_task = self.reader.readexactly(68)
             response = await asyncio.wait_for(read_task, timeout=self.timeout)
 
             resp_pstrlen = response[0]
             resp_pstr = response[1:1 + resp_pstrlen]
+            resp_reserved = response[1 + resp_pstrlen:1 + resp_pstrlen + 8]
             resp_hash = response[1 + resp_pstrlen + 8:1 + resp_pstrlen + 8 + 20]
 
             if resp_pstr == PROTOCOL_IDENTIFIER and resp_hash == self.info_hash:
                 self.is_connected = True
+                self.supports_extensions = ExtensionProtocol.peer_supports_extensions(resp_reserved)
                 return True
             else:
                 await self.close()
@@ -87,7 +87,6 @@ class AsyncPeerConnection:
             msg_length = struct.unpack(">I", length_bytes)[0]
 
             if msg_length == 0:
-                # Keep-alive
                 return b"\x00\x00\x00\x00"
 
             payload = await self.reader.readexactly(msg_length)
