@@ -1,10 +1,11 @@
 import asyncio
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 from colorama import Fore, Style, init
 
 from core.async_peer import AsyncPeerConnection
 from core.extension_protocol import ExtensionProtocol, MetadataAssembler
 from core.magnet_parser import MagnetLinkData
+from core.pex_protocol import PeerExchangeProtocol
 from core.piece_manager import PieceManager
 from core.protocol_messages import TorrentMessage
 from core.tracker_client import TrackerClient
@@ -16,7 +17,7 @@ class BitTorrentClient:
     """
     Asynchronous BitTorrent client orchestrating parallel peer workers,
     pipelined block downloads, rarest-first scheduling, End-Game mode,
-    and Magnet link metadata resolution (BEP-0009/BEP-0010).
+    Magnet link metadata resolution, and live Peer Exchange (PEX).
     """
 
     def __init__(self, torrent_metadata: dict):
@@ -73,6 +74,8 @@ class BitTorrentClient:
             self.num_pieces = 1
 
         self.active_connections: Dict[str, AsyncPeerConnection] = {}
+        self.known_peers: Set[Tuple[str, int]] = set()
+        self.worker_tasks: List[asyncio.Task] = []
 
     @classmethod
     async def fetch_metadata_from_magnet(
@@ -114,7 +117,6 @@ class BitTorrentClient:
                 await conn.send_message(ext_handshake)
 
                 assembler: Optional[MetadataAssembler] = None
-                peer_ut_meta_id: Optional[int] = None
 
                 for _ in range(25):
                     raw_msg = await asyncio.wait_for(conn.read_message(), timeout=4.0)
@@ -159,6 +161,34 @@ class BitTorrentClient:
 
         return None
 
+    def _spawn_peer_worker_if_new(
+        self,
+        ip: str,
+        port: int,
+        raw_info_hash: bytes,
+        my_peer_id: bytes,
+        manager: PieceManager,
+        max_peers: int
+    ):
+        peer_addr = (ip, port)
+        if peer_addr in self.known_peers:
+            return
+        if len(self.known_peers) >= max_peers:
+            return
+
+        self.known_peers.add(peer_addr)
+        task = asyncio.create_task(
+            self._peer_worker(
+                ip=ip,
+                port=port,
+                raw_info_hash=raw_info_hash,
+                my_peer_id=my_peer_id,
+                manager=manager,
+                max_peers=max_peers
+            )
+        )
+        self.worker_tasks.append(task)
+
     async def _peer_worker(
         self,
         ip: str,
@@ -166,6 +196,7 @@ class BitTorrentClient:
         raw_info_hash: bytes,
         my_peer_id: bytes,
         manager: PieceManager,
+        max_peers: int = 25,
         pipeline_depth: int = 4
     ):
         peer_tag = f"{ip}:{port}"
@@ -180,6 +211,11 @@ class BitTorrentClient:
         print(f"{Fore.GREEN}[+] Worker active for peer {peer_tag}{Style.RESET_ALL}")
 
         try:
+            # Negotiate extension protocol if peer supports BEP-0010
+            if peer_conn.supports_extensions:
+                ext_hs = ExtensionProtocol.create_extension_handshake()
+                await peer_conn.send_message(ext_hs)
+
             await peer_conn.send_message(TorrentMessage.create_interested())
 
             while not all(manager.have_pieces):
@@ -232,6 +268,22 @@ class BitTorrentClient:
                         if target_conn is not None:
                             await target_conn.send_message(cancel_pkt)
 
+                elif msg_id == ExtensionProtocol.MSG_EXTENDED:
+                    payload_body = raw_msg[4:]
+                    if len(payload_body) >= 2:
+                        ext_sub_id = payload_body[1]
+                        if ext_sub_id == ExtensionProtocol.LOCAL_UT_PEX_ID:
+                            added_peers, _ = PeerExchangeProtocol.parse_pex_message(payload_body)
+                            for new_ip, new_port in added_peers:
+                                self._spawn_peer_worker_if_new(
+                                    ip=new_ip,
+                                    port=new_port,
+                                    raw_info_hash=raw_info_hash,
+                                    my_peer_id=my_peer_id,
+                                    manager=manager,
+                                    max_peers=max_peers
+                                )
+
         except Exception as err:
             print(f"{Fore.RED}[!] Peer worker error ({peer_tag}): {err}{Style.RESET_ALL}")
         finally:
@@ -243,7 +295,7 @@ class BitTorrentClient:
         self,
         raw_info_hash: bytes,
         my_peer_id: bytes,
-        max_peers: int = 15
+        max_peers: int = 25
     ):
         mode_label = "Multi-File" if len(self.file_entries) > 0 else "Single-File"
         print(f"\n{Fore.YELLOW}[*] Launching Async Engine ({mode_label}) for '{self.target_filename}'...{Style.RESET_ALL}")
@@ -262,7 +314,7 @@ class BitTorrentClient:
         if isinstance(tracker_url, bytes):
             tracker_url = tracker_url.decode("utf-8", errors="ignore")
 
-        discovered_peers: List = []
+        discovered_peers: List[Tuple[str, int]] = []
         if tracker_url:
             tracker = TrackerClient(raw_info_hash, my_peer_id)
             announce_data = tracker.announce(tracker_url, left=self.total_length)
@@ -272,22 +324,22 @@ class BitTorrentClient:
             print(f"{Fore.YELLOW}[*] No external peers found. Setting local swarm test entry (127.0.0.1:6881)...{Style.RESET_ALL}")
             discovered_peers = [("127.0.0.1", 6881)]
 
-        active_worker_tasks = []
+        self.known_peers.clear()
+        self.worker_tasks.clear()
+
         for peer_ip, peer_port in discovered_peers[:max_peers]:
-            worker_task = asyncio.create_task(
-                self._peer_worker(
-                    ip=peer_ip,
-                    port=peer_port,
-                    raw_info_hash=raw_info_hash,
-                    my_peer_id=my_peer_id,
-                    manager=manager
-                )
+            self._spawn_peer_worker_if_new(
+                ip=peer_ip,
+                port=peer_port,
+                raw_info_hash=raw_info_hash,
+                my_peer_id=my_peer_id,
+                manager=manager,
+                max_peers=max_peers
             )
-            active_worker_tasks.append(worker_task)
 
         while not all(manager.have_pieces):
             all_done = True
-            for t in active_worker_tasks:
+            for t in list(self.worker_tasks):
                 if not t.done():
                     all_done = False
                     break
@@ -298,9 +350,9 @@ class BitTorrentClient:
 
             await asyncio.sleep(1.0)
             status_tag = " [END-GAME]" if manager.is_endgame_active() else ""
-            print(f"{Fore.CYAN}[*] Download Progress{status_tag}: {manager.status_report()}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}[*] Download Progress{status_tag} (Swarm: {len(self.known_peers)} peers): {manager.status_report()}{Style.RESET_ALL}")
 
-        for t in active_worker_tasks:
+        for t in self.worker_tasks:
             if not t.done():
                 t.cancel()
 
@@ -308,7 +360,7 @@ class BitTorrentClient:
         print(f"Status: {manager.status_report()}")
         print(f"Output Path: {manager.writer.final_path.resolve()}")
 
-    def start_download_loop(self, raw_info_hash: bytes, my_peer_id: bytes, max_peers: int = 10):
+    def start_download_loop(self, raw_info_hash: bytes, my_peer_id: bytes, max_peers: int = 25):
         asyncio.run(
             self.start_async_download(
                 raw_info_hash=raw_info_hash,
