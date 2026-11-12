@@ -1,5 +1,13 @@
+import asyncio
+import hashlib
+import struct
+import pytest
+from core.async_peer import PROTOCOL_IDENTIFIER
+from core.client_logic import BitTorrentClient
 from core.extension_protocol import ExtensionProtocol
+from core.parser import TorrentEncoder
 from core.pex_protocol import PeerExchangeProtocol
+from core.protocol_messages import TorrentMessage
 
 
 def test_pex_compact_encode_and_decode():
@@ -21,7 +29,6 @@ def test_pex_message_roundtrip():
         dropped_peers=dropped
     )
 
-    # Strip 4-byte length prefix
     payload = msg_packet[4:]
     parsed_added, parsed_dropped = PeerExchangeProtocol.parse_pex_message(payload)
 
@@ -35,3 +42,106 @@ def test_extended_capabilities_detection():
 
     assert caps["ut_metadata"] == ExtensionProtocol.LOCAL_UT_METADATA_ID
     assert caps["ut_pex"] == ExtensionProtocol.LOCAL_UT_PEX_ID
+
+
+@pytest.mark.asyncio
+async def test_client_spawns_worker_on_pex_message(tmp_path):
+    payload_data = b"P" * 16384
+    piece_hash = hashlib.sha1(payload_data).digest()
+
+    info_dict = {
+        "name": "pex_test.bin",
+        "piece length": 16384,
+        "length": 16384,
+        "pieces": piece_hash
+    }
+    raw_info = TorrentEncoder.encode(info_dict)
+    info_hash = hashlib.sha1(raw_info).digest()
+
+    # Peer 2 actually holds the piece and serves it
+    async def peer_seeder_handler(reader, writer):
+        await reader.readexactly(68)
+        reserved = ExtensionProtocol.build_reserved_bytes()
+        hs = struct.pack(">B19s8s20s20s", 19, PROTOCOL_IDENTIFIER, reserved, info_hash, b"-SEED02-000000000002")
+        writer.write(hs)
+        writer.write(TorrentMessage.create_unchoke())
+        writer.write(TorrentMessage.create_have(0))
+        await writer.drain()
+
+        while True:
+            hdr = await reader.readexactly(4)
+            msg_len = struct.unpack(">I", hdr)[0]
+            if msg_len == 0:
+                continue
+            body = await reader.readexactly(msg_len)
+            if body[0] == TorrentMessage.MSG_REQUEST:
+                p_idx, off, length = struct.unpack(">III", body[1:13])
+                piece_msg = struct.pack(">IBII", 9 + length, TorrentMessage.MSG_PIECE, p_idx, off) + payload_data
+                writer.write(piece_msg)
+                await writer.drain()
+                break
+
+        await asyncio.sleep(0.05)
+        writer.close()
+        await writer.wait_closed()
+
+    seeder_server = await asyncio.start_server(peer_seeder_handler, "127.0.0.1", 0)
+    seeder_port = seeder_server.sockets[0].getsockname()[1]
+
+    # Peer 1 doesn't have the piece, but sends a PEX message pointing to Peer 2
+    async def peer_introducer_handler(reader, writer):
+        await reader.readexactly(68)
+        reserved = ExtensionProtocol.build_reserved_bytes()
+        hs = struct.pack(">B19s8s20s20s", 19, PROTOCOL_IDENTIFIER, reserved, info_hash, b"-INTR01-000000000001")
+        writer.write(hs)
+
+        pex_msg = PeerExchangeProtocol.create_pex_message(
+            peer_ut_pex_id=ExtensionProtocol.LOCAL_UT_PEX_ID,
+            added_peers=[("127.0.0.1", seeder_port)]
+        )
+        writer.write(pex_msg)
+        await writer.drain()
+
+        await asyncio.sleep(0.3)
+        writer.close()
+        await writer.wait_closed()
+
+    intro_server = await asyncio.start_server(peer_introducer_handler, "127.0.0.1", 0)
+    intro_port = intro_server.sockets[0].getsockname()[1]
+
+    metadata = {"info": info_dict}
+    client = BitTorrentClient(metadata)
+
+    # Start download connecting ONLY to intro_port initially
+    from core.piece_manager import PieceManager
+    manager = PieceManager("pex_test.bin", 16384, 1, total_length=16384)
+    manager.writer.output_dir = tmp_path
+    manager.writer.final_path = tmp_path / "pex_test.bin"
+    manager.writer.initialize_file()
+    manager.writer.piece_hashes = [piece_hash]
+
+    client._spawn_peer_worker_if_new(
+        ip="127.0.0.1",
+        port=intro_port,
+        raw_info_hash=info_hash,
+        my_peer_id=b"-PY0001-999999999999",
+        manager=manager,
+        max_peers=10
+    )
+
+    for _ in range(30):
+        if all(manager.have_pieces):
+            break
+        await asyncio.sleep(0.1)
+
+    assert all(manager.have_pieces) is True
+    assert ("127.0.0.1", seeder_port) in client.known_peers
+
+    for t in client.worker_tasks:
+        if not t.done():
+            t.cancel()
+
+    intro_server.close()
+    await intro_server.wait_closed()
+    seeder_server.close()
+    await seeder_server.wait_closed()
