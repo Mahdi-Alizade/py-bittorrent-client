@@ -1,8 +1,10 @@
 import asyncio
-from typing import Dict, List
+from typing import Dict, List, Optional
 from colorama import Fore, Style, init
 
 from core.async_peer import AsyncPeerConnection
+from core.extension_protocol import ExtensionProtocol, MetadataAssembler
+from core.magnet_parser import MagnetLinkData
 from core.piece_manager import PieceManager
 from core.protocol_messages import TorrentMessage
 from core.tracker_client import TrackerClient
@@ -13,7 +15,8 @@ init(autoreset=True)
 class BitTorrentClient:
     """
     Asynchronous BitTorrent client orchestrating parallel peer workers,
-    pipelined block downloads, rarest-first scheduling, and End-Game mode.
+    pipelined block downloads, rarest-first scheduling, End-Game mode,
+    and Magnet link metadata resolution (BEP-0009/BEP-0010).
     """
 
     def __init__(self, torrent_metadata: dict):
@@ -69,8 +72,92 @@ class BitTorrentClient:
         else:
             self.num_pieces = 1
 
-        # Registry of live peer connections for End-Game cancel dispatches
         self.active_connections: Dict[str, AsyncPeerConnection] = {}
+
+    @classmethod
+    async def fetch_metadata_from_magnet(
+        cls,
+        magnet_data: MagnetLinkData,
+        my_peer_id: bytes,
+        peer_list: Optional[List] = None
+    ) -> Optional[dict]:
+        """
+        Resolves full torrent metadata dictionary by contacting peers over BEP-0010/BEP-0009.
+        """
+        print(f"{Fore.CYAN}[*] Resolving metadata for magnet: {magnet_data.display_name}{Style.RESET_ALL}")
+
+        peers_to_try = list(peer_list) if peer_list else []
+
+        if not peers_to_try and magnet_data.trackers:
+            tracker = TrackerClient(magnet_data.info_hash, my_peer_id)
+            for tr_url in magnet_data.trackers:
+                res = tracker.announce(tr_url, left=1000)
+                found = res.get("peers", [])
+                for p in found:
+                    if p not in peers_to_try:
+                        peers_to_try.append(p)
+                if len(peers_to_try) >= 15:
+                    break
+
+        for ip, port in peers_to_try:
+            conn = AsyncPeerConnection(ip, port, magnet_data.info_hash, my_peer_id, timeout=5.0)
+            ok = await conn.connect_and_handshake()
+            if not ok:
+                continue
+
+            if not conn.supports_extensions:
+                await conn.close()
+                continue
+
+            try:
+                ext_handshake = ExtensionProtocol.create_extension_handshake()
+                await conn.send_message(ext_handshake)
+
+                assembler: Optional[MetadataAssembler] = None
+                peer_ut_meta_id: Optional[int] = None
+
+                for _ in range(25):
+                    raw_msg = await asyncio.wait_for(conn.read_message(), timeout=4.0)
+                    if raw_msg is None:
+                        break
+                    if len(raw_msg) <= 4:
+                        continue
+
+                    msg_id = raw_msg[4]
+                    if msg_id == ExtensionProtocol.MSG_EXTENDED:
+                        payload_body = raw_msg[4:]
+                        ext_sub_id = payload_body[1]
+
+                        if ext_sub_id == ExtensionProtocol.HANDSHAKE_EXT_ID:
+                            peer_ut_meta_id, meta_size = ExtensionProtocol.parse_extension_handshake(payload_body)
+                            if peer_ut_meta_id is not None and meta_size is not None and meta_size > 0:
+                                assembler = MetadataAssembler(magnet_data.info_hash, meta_size)
+                                for p_idx in assembler.get_missing_pieces():
+                                    req = ExtensionProtocol.create_metadata_request(peer_ut_meta_id, p_idx)
+                                    await conn.send_message(req)
+
+                        elif ext_sub_id == ExtensionProtocol.LOCAL_UT_METADATA_ID and assembler is not None:
+                            parsed_meta = ExtensionProtocol.parse_metadata_message(payload_body)
+                            if parsed_meta is not None:
+                                m_type, p_idx, chunk = parsed_meta
+                                if m_type == ExtensionProtocol.META_DATA:
+                                    assembler.add_piece(p_idx, chunk)
+                                    if assembler.is_complete():
+                                        verified_info = assembler.assemble_and_verify()
+                                        if verified_info is not None:
+                                            print(f"{Fore.GREEN}[+] Metadata fetched and verified via ut_metadata!{Style.RESET_ALL}")
+                                            await conn.close()
+                                            result_meta = {"info": verified_info}
+                                            if magnet_data.trackers:
+                                                result_meta["announce"] = magnet_data.trackers[0]
+                                                result_meta["announce-list"] = [[t] for t in magnet_data.trackers]
+                                            return result_meta
+            except Exception:
+                pass
+            finally:
+                await conn.close()
+
+        return None
 
     async def _peer_worker(
         self,
