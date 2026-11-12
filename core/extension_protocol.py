@@ -1,7 +1,7 @@
 import hashlib
 import math
 import struct
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 from core.parser import BDecoder, TorrentEncoder
 
 
@@ -103,6 +103,44 @@ class ExtensionProtocol:
         return header + encoded_dict
 
     @classmethod
+    def _find_bencoded_dict_end(cls, data: bytes) -> int:
+        """
+        Finds the exact byte offset where the leading bencoded dictionary ends.
+        """
+        if not data or data[0:1] != b"d":
+            return -1
+
+        idx = 0
+        length = len(data)
+        depth = 0
+
+        while idx < length:
+            token = data[idx:idx + 1]
+            if token in (b"d", b"l"):
+                depth += 1
+                idx += 1
+            elif token == b"i":
+                end_int = data.find(b"e", idx + 1)
+                if end_int == -1:
+                    return -1
+                idx = end_int + 1
+            elif token == b"e":
+                depth -= 1
+                idx += 1
+                if depth == 0:
+                    return idx
+            elif token.isdigit():
+                colon_pos = data.find(b":", idx)
+                if colon_pos == -1:
+                    return -1
+                str_len = int(data[idx:colon_pos])
+                idx = colon_pos + 1 + str_len
+            else:
+                return -1
+
+        return -1
+
+    @classmethod
     def parse_metadata_message(cls, payload_bytes: bytes) -> Optional[Tuple[int, int, bytes]]:
         """
         Parses an incoming ut_metadata message (excluding 4-byte length prefix).
@@ -118,17 +156,32 @@ class ExtensionProtocol:
             return None
 
         body = payload_bytes[2:]
+        dict_end = cls._find_bencoded_dict_end(body)
+        if dict_end == -1:
+            return None
+
+        header_bytes = body[:dict_end]
+        raw_chunk = body[dict_end:]
+
         try:
-            decoder = BDecoder(body)
-            header_dict = decoder.decode()
+            header_dict = BDecoder(header_bytes).decode()
             if not isinstance(header_dict, dict):
                 return None
 
-            msg_type = int(header_dict.get(b"msg_type") if b"msg_type" in header_dict else header_dict.get("msg_type", -1))
-            piece_idx = int(header_dict.get(b"piece") if b"piece" in header_dict else header_dict.get("piece", -1))
+            if b"msg_type" in header_dict:
+                msg_type = int(header_dict[b"msg_type"])
+            elif "msg_type" in header_dict:
+                msg_type = int(header_dict["msg_type"])
+            else:
+                msg_type = -1
 
-            # Remaining bytes after the bencoded dictionary represent the raw metadata piece
-            raw_chunk = body[decoder.index:]
+            if b"piece" in header_dict:
+                piece_idx = int(header_dict[b"piece"])
+            elif "piece" in header_dict:
+                piece_idx = int(header_dict["piece"])
+            else:
+                piece_idx = -1
+
             return msg_type, piece_idx, raw_chunk
         except Exception:
             return None
@@ -145,7 +198,7 @@ class MetadataAssembler:
         self.metadata_size = metadata_size
         self.piece_size = ExtensionProtocol.METADATA_PIECE_SIZE
         self.num_pieces = max(1, math.ceil(metadata_size / self.piece_size))
-        self.pieces: Dict[int, bytes] = {}
+        self.pieces: dict[int, bytes] = {}
 
     def add_piece(self, piece_index: int, chunk: bytes):
         if 0 <= piece_index < self.num_pieces:
