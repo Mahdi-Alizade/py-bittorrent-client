@@ -1,7 +1,7 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from colorama import Fore, Style, init
 
-from core.block_picker import PieceBlockTracker
+from core.block_picker import BlockState, PieceBlockTracker
 from core.piece_selector import RarestFirstSelector
 from core.protocol_messages import TorrentMessage
 from core.reassemble import DownloadSession
@@ -11,8 +11,8 @@ init(autoreset=True)
 
 class PieceManager:
     """
-    Coordinates piece downloading, block pipelining, and rarest-first selection.
-    Supports both single-file and multi-file torrent layouts.
+    Coordinates piece downloading, block pipelining, rarest-first selection,
+    and End-Game Mode cancellation broadcasts.
     """
 
     def __init__(
@@ -53,6 +53,9 @@ class PieceManager:
         # Tracking completed status
         self.have_pieces: List[bool] = [False] * num_pieces
 
+        # End-Game Mode tracking: {(piece_idx, offset): [peer_id_1, peer_id_2, ...]}
+        self.endgame_requests: Dict[Tuple[int, int], List[str]] = {}
+
     def _initialize_trackers(self):
         for piece_idx in range(self.num_pieces):
             piece_size = self.get_piece_size(piece_idx)
@@ -77,6 +80,9 @@ class PieceManager:
 
     def unregister_peer(self, peer_id: str):
         self.selector.unregister_peer(peer_id)
+        for key in list(self.endgame_requests.keys()):
+            if peer_id in self.endgame_requests[key]:
+                self.endgame_requests[key].remove(peer_id)
 
     def handle_peer_have(self, peer_id: str, piece_idx: int):
         self.selector.record_peer_have(peer_id, piece_idx)
@@ -84,9 +90,34 @@ class PieceManager:
     def handle_peer_bitfield(self, peer_id: str, bitfield_bytes: bytes):
         self.selector.record_peer_bitfield(peer_id, bitfield_bytes)
 
-    def handle_message(self, raw_data: bytes):
+    def is_endgame_active(self) -> bool:
+        """
+        Determines if client should enter End-Game mode (when >= 90% pieces are done
+        or <= 2 pieces remain incomplete).
+        """
+        if self.num_pieces <= 1:
+            return False
+
+        completed = sum(1 for status in self.have_pieces if status)
+        remaining = self.num_pieces - completed
+
+        if remaining == 0:
+            return False
+
+        ratio = completed / self.num_pieces
+        if ratio >= 0.90 or remaining <= 2:
+            return True
+        return False
+
+    def handle_message(self, raw_data: bytes, source_peer_id: Optional[str] = None) -> List[Tuple[str, bytes]]:
+        """
+        Processes incoming messages and returns a list of (target_peer_id, cancel_packet)
+        if an End-Game block was fulfilled and other peers need to be cancelled.
+        """
+        cancel_notifications: List[Tuple[str, bytes]] = []
+
         if len(raw_data) < 5:
-            return
+            return cancel_notifications
 
         msg_id = raw_data[4]
 
@@ -95,6 +126,17 @@ class PieceManager:
             if parsed is not None:
                 piece_idx, offset, block_data = parsed
                 self._store_block(piece_idx, offset, block_data)
+
+                # Generate CANCEL messages for duplicate endgame requests
+                block_key = (piece_idx, offset)
+                if block_key in self.endgame_requests:
+                    peers_to_cancel = self.endgame_requests.pop(block_key)
+                    cancel_pkt = TorrentMessage.create_cancel(piece_idx, offset, len(block_data))
+                    for target_peer in peers_to_cancel:
+                        if target_peer != source_peer_id:
+                            cancel_notifications.append((target_peer, cancel_pkt))
+
+        return cancel_notifications
 
     def _store_block(self, piece_idx: int, offset: int, block_data: bytes):
         if piece_idx not in self.trackers:
@@ -119,6 +161,12 @@ class PieceManager:
                 self.selector.mark_piece_failed(piece_idx)
 
     def get_next_request_for_peer(self, peer_id: str) -> Optional[bytes]:
+        # Check if End-Game mode applies
+        if self.is_endgame_active():
+            endgame_pkt = self._get_endgame_request(peer_id)
+            if endgame_pkt is not None:
+                return endgame_pkt
+
         # First priority: complete pieces already in progress
         for piece_idx in list(self.selector.in_progress_pieces):
             if piece_idx in self.selector.peer_inventory.get(peer_id, set()):
@@ -137,6 +185,32 @@ class PieceManager:
                 block.mark_requested()
                 return TorrentMessage.create_request(chosen_piece, block.block_offset, block.block_length)
 
+        return None
+
+    def _get_endgame_request(self, peer_id: str) -> Optional[bytes]:
+        """Broadcasts requests for any uncompleted block across all capable peers."""
+        peer_owned = self.selector.peer_inventory.get(peer_id, set())
+
+        for piece_idx in range(self.num_pieces):
+            if self.have_pieces[piece_idx]:
+                continue
+            if piece_idx not in peer_owned:
+                continue
+
+            tracker = self.trackers[piece_idx]
+            for block in tracker.blocks:
+                if block.state != BlockState.COMPLETED:
+                    block_key = (piece_idx, block.block_offset)
+                    requested_peers = self.endgame_requests.setdefault(block_key, [])
+
+                    if peer_id not in requested_peers:
+                        requested_peers.append(peer_id)
+                        block.mark_requested()
+                        return TorrentMessage.create_request(
+                            piece_idx,
+                            block.block_offset,
+                            block.block_length
+                        )
         return None
 
     def status_report(self) -> str:
