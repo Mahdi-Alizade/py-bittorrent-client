@@ -1,6 +1,6 @@
 import socket
 import struct
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 from core.parser import BDecoder, TorrentEncoder
 
 
@@ -17,9 +17,6 @@ class PeerExchangeProtocol:
 
     @staticmethod
     def encode_compact_peers(peers: List[Tuple[str, int]]) -> bytes:
-        """
-        Encodes a list of (ip, port) tuples into compact 6-byte binary format.
-        """
         buffer = bytearray()
         for ip_str, port_num in peers:
             try:
@@ -33,9 +30,6 @@ class PeerExchangeProtocol:
 
     @staticmethod
     def decode_compact_peers(compact_bytes: bytes) -> List[Tuple[str, int]]:
-        """
-        Decodes compact 6-byte peer chunks into (ip, port) tuples.
-        """
         decoded_list: List[Tuple[str, int]] = []
         if not compact_bytes or len(compact_bytes) % 6 != 0:
             return decoded_list
@@ -61,9 +55,6 @@ class PeerExchangeProtocol:
         added_peers: List[Tuple[str, int]],
         dropped_peers: Optional[List[Tuple[str, int]]] = None
     ) -> bytes:
-        """
-        Builds a full framed BEP-0011 PEX message ready to send over TCP wire.
-        """
         added_compact = cls.encode_compact_peers(added_peers)
         added_flags = b"\x00" * len(added_peers)
 
@@ -82,10 +73,6 @@ class PeerExchangeProtocol:
 
     @classmethod
     def parse_pex_message(cls, payload_bytes: bytes) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
-        """
-        Parses an incoming ut_pex payload (excluding 4-byte length prefix).
-        Returns (added_peers_list, dropped_peers_list).
-        """
         if len(payload_bytes) < 2:
             return [], []
 
