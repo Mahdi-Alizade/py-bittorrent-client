@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from colorama import Fore, Style, init
 
 from core.async_peer import AsyncPeerConnection
+from core.dht_client import DHTCrawler
 from core.extension_protocol import ExtensionProtocol, MetadataAssembler
 from core.magnet_parser import MagnetLinkData
 from core.pex_protocol import PeerExchangeProtocol
@@ -17,11 +18,12 @@ class BitTorrentClient:
     """
     Asynchronous BitTorrent client orchestrating parallel peer workers,
     pipelined block downloads, rarest-first scheduling, End-Game mode,
-    Magnet link metadata resolution, and live Peer Exchange (PEX).
+    Magnet link metadata resolution, live Peer Exchange (PEX), and Kademlia DHT.
     """
 
-    def __init__(self, torrent_metadata: dict):
+    def __init__(self, torrent_metadata: dict, enable_dht: bool = True):
         self.metadata = torrent_metadata
+        self.enable_dht = enable_dht
         self.info_block = torrent_metadata.get(b"info") or torrent_metadata.get("info")
 
         if not self.info_block:
@@ -82,10 +84,12 @@ class BitTorrentClient:
         cls,
         magnet_data: MagnetLinkData,
         my_peer_id: bytes,
-        peer_list: Optional[List] = None
+        peer_list: Optional[List] = None,
+        use_dht: bool = True
     ) -> Optional[dict]:
         """
-        Resolves full torrent metadata dictionary by contacting peers over BEP-0010/BEP-0009.
+        Resolves full torrent metadata dictionary by contacting peers over BEP-0010/BEP-0009,
+        combining peers from both Trackers and Kademlia DHT.
         """
         print(f"{Fore.CYAN}[*] Resolving metadata for magnet: {magnet_data.display_name}{Style.RESET_ALL}")
 
@@ -101,6 +105,21 @@ class BitTorrentClient:
                         peers_to_try.append(p)
                 if len(peers_to_try) >= 15:
                     break
+
+        # Fallback or supplement via Kademlia DHT if needed
+        if len(peers_to_try) < 5 and use_dht:
+            print(f"{Fore.CYAN}[*] Querying Kademlia DHT network for peers...{Style.RESET_ALL}")
+            dht_crawler = DHTCrawler(local_id=my_peer_id)
+            dht_peers = await asyncio.to_thread(
+                dht_crawler.discover_peers_sync,
+                magnet_data.info_hash,
+                None,
+                2,
+                2.0
+            )
+            for p in dht_peers:
+                if p not in peers_to_try:
+                    peers_to_try.append(p)
 
         for ip, port in peers_to_try:
             conn = AsyncPeerConnection(ip, port, magnet_data.info_hash, my_peer_id, timeout=5.0)
@@ -211,7 +230,6 @@ class BitTorrentClient:
         print(f"{Fore.GREEN}[+] Worker active for peer {peer_tag}{Style.RESET_ALL}")
 
         try:
-            # Negotiate extension protocol if peer supports BEP-0010
             if peer_conn.supports_extensions:
                 ext_hs = ExtensionProtocol.create_extension_handshake()
                 await peer_conn.send_message(ext_hs)
@@ -319,6 +337,21 @@ class BitTorrentClient:
             tracker = TrackerClient(raw_info_hash, my_peer_id)
             announce_data = tracker.announce(tracker_url, left=self.total_length)
             discovered_peers = announce_data.get("peers", [])
+
+        # Supplement peer pool with Kademlia DHT lookup if enabled
+        if self.enable_dht and len(discovered_peers) < max_peers:
+            print(f"{Fore.CYAN}[*] Searching Kademlia DHT for additional swarm peers...{Style.RESET_ALL}")
+            dht_crawler = DHTCrawler(local_id=my_peer_id)
+            dht_peers = await asyncio.to_thread(
+                dht_crawler.discover_peers_sync,
+                raw_info_hash,
+                None,
+                2,
+                2.0
+            )
+            for p in dht_peers:
+                if p not in discovered_peers:
+                    discovered_peers.append(p)
 
         if not discovered_peers:
             print(f"{Fore.YELLOW}[*] No external peers found. Setting local swarm test entry (127.0.0.1:6881)...{Style.RESET_ALL}")
