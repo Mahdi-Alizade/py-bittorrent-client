@@ -1,7 +1,5 @@
 import asyncio
-import time
-from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 from colorama import Fore, Style, init
 
 from core.async_peer import AsyncPeerConnection
@@ -25,7 +23,7 @@ class BitTorrentClient:
         if not self.info_block:
             raise ValueError("Invalid torrent metadata: Missing 'info' dictionary")
 
-        # Extract target filename safely
+        # Extract target filename or root folder name
         raw_name = self.info_block.get(b"name") or self.info_block.get("name")
         if isinstance(raw_name, bytes):
             self.target_filename = raw_name.decode("utf-8", errors="ignore")
@@ -34,23 +32,29 @@ class BitTorrentClient:
         else:
             self.target_filename = "downloaded_payload.bin"
 
-        # Determine piece length
         self.piece_length = int(
             self.info_block.get(b"piece length") or self.info_block.get("piece length", 16384)
         )
 
-        # Calculate total byte length
-        if b"length" in self.info_block:
+        # Extract file entries for multi-file torrents if present
+        self.file_entries: List[Dict] = []
+        raw_files = self.info_block.get(b"files") or self.info_block.get("files")
+
+        if raw_files and isinstance(raw_files, list):
+            total_sum = 0
+            for item in raw_files:
+                file_len = int(item.get(b"length") or item.get("length", 0))
+                path_list = item.get(b"path") or item.get("path", [])
+                self.file_entries.append({
+                    "length": file_len,
+                    "path": path_list
+                })
+                total_sum += file_len
+            self.total_length = total_sum
+        elif b"length" in self.info_block:
             self.total_length = int(self.info_block[b"length"])
         elif "length" in self.info_block:
             self.total_length = int(self.info_block["length"])
-        elif b"files" in self.info_block or "files" in self.info_block:
-            files_list = self.info_block.get(b"files") or self.info_block.get("files", [])
-            total_sum = 0
-            for item in files_list:
-                file_len = item.get(b"length") or item.get("length", 0)
-                total_sum += int(file_len)
-            self.total_length = total_sum
         else:
             self.total_length = self.piece_length
 
@@ -77,10 +81,6 @@ class BitTorrentClient:
         manager: PieceManager,
         pipeline_depth: int = 4
     ):
-        """
-        Independent async worker dedicated to handling bidirectional protocol
-        traffic with a single peer connection.
-        """
         peer_tag = f"{ip}:{port}"
         peer_conn = AsyncPeerConnection(ip, port, raw_info_hash, my_peer_id, timeout=5.0)
 
@@ -92,11 +92,9 @@ class BitTorrentClient:
         print(f"{Fore.GREEN}[+] Worker active for peer {peer_tag}{Style.RESET_ALL}")
 
         try:
-            # Express interest
             await peer_conn.send_message(TorrentMessage.create_interested())
 
             while not all(manager.have_pieces):
-                # 1. Pipeline block requests if unchoked
                 if not peer_conn.is_choked:
                     for _ in range(pipeline_depth):
                         req_packet = manager.get_next_request_for_peer(peer_tag)
@@ -107,19 +105,16 @@ class BitTorrentClient:
                         else:
                             break
 
-                # 2. Read incoming wire message with timeout
                 try:
                     read_coro = peer_conn.read_message()
                     raw_msg = await asyncio.wait_for(read_coro, timeout=3.0)
                 except asyncio.TimeoutError:
-                    # Timeout check: keep worker alive or send keep-alive
                     await peer_conn.send_message(TorrentMessage.create_keep_alive())
                     continue
 
                 if raw_msg is None:
                     break
 
-                # 3. Parse and update state
                 if len(raw_msg) == 4 and raw_msg == b"\x00\x00\x00\x00":
                     continue
 
@@ -157,18 +152,19 @@ class BitTorrentClient:
         my_peer_id: bytes,
         max_peers: int = 15
     ):
-        print(f"\n{Fore.YELLOW}[*] Launching Async Engine for '{self.target_filename}'...{Style.RESET_ALL}")
+        mode_label = "Multi-File" if len(self.file_entries) > 0 else "Single-File"
+        print(f"\n{Fore.YELLOW}[*] Launching Async Engine ({mode_label}) for '{self.target_filename}'...{Style.RESET_ALL}")
         print(f"[*] Total Bytes: {self.total_length} | Total Pieces: {self.num_pieces}")
 
         manager = PieceManager(
             filename=self.target_filename,
             piece_length=self.piece_length,
             num_pieces=self.num_pieces,
-            total_length=self.total_length
+            total_length=self.total_length,
+            file_entries=self.file_entries
         )
         manager.writer.piece_hashes = self.piece_hashes
 
-        # Announce to tracker
         tracker_url = self.metadata.get(b"announce") or self.metadata.get("announce")
         if isinstance(tracker_url, bytes):
             tracker_url = tracker_url.decode("utf-8", errors="ignore")
@@ -183,7 +179,6 @@ class BitTorrentClient:
             print(f"{Fore.YELLOW}[*] No external peers found. Setting local swarm test entry (127.0.0.1:6881)...{Style.RESET_ALL}")
             discovered_peers = [("127.0.0.1", 6881)]
 
-        # Spawn concurrent async workers
         active_worker_tasks = []
         for peer_ip, peer_port in discovered_peers[:max_peers]:
             worker_task = asyncio.create_task(
@@ -197,7 +192,6 @@ class BitTorrentClient:
             )
             active_worker_tasks.append(worker_task)
 
-        # Progress monitor loop
         while not all(manager.have_pieces):
             all_done = True
             for t in active_worker_tasks:
@@ -212,17 +206,15 @@ class BitTorrentClient:
             await asyncio.sleep(1.0)
             print(f"{Fore.CYAN}[*] Download Progress: {manager.status_report()}{Style.RESET_ALL}")
 
-        # Cancel remaining workers once complete
         for t in active_worker_tasks:
             if not t.done():
                 t.cancel()
 
         print(f"\n{Fore.GREEN}=== DOWNLOAD SESSION COMPLETED ==={Style.RESET_ALL}")
         print(f"Status: {manager.status_report()}")
-        print(f"Output File: {manager.writer.final_path.resolve()}")
+        print(f"Output Path: {manager.writer.final_path.resolve()}")
 
     def start_download_loop(self, raw_info_hash: bytes, my_peer_id: bytes, max_peers: int = 10):
-        """Synchronous wrapper to bootstrap the asyncio event loop."""
         asyncio.run(
             self.start_async_download(
                 raw_info_hash=raw_info_hash,
