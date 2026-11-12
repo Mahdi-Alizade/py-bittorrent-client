@@ -1,7 +1,7 @@
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from colorama import Fore, Style, init
 
-from core.block_picker import BlockState, PieceBlockTracker
+from core.block_picker import PieceBlockTracker
 from core.piece_selector import RarestFirstSelector
 from core.protocol_messages import TorrentMessage
 from core.reassemble import DownloadSession
@@ -12,6 +12,7 @@ init(autoreset=True)
 class PieceManager:
     """
     Coordinates piece downloading, block pipelining, and rarest-first selection.
+    Supports both single-file and multi-file torrent layouts.
     """
 
     def __init__(
@@ -19,7 +20,8 @@ class PieceManager:
         filename: str,
         piece_length: int,
         num_pieces: int,
-        total_length: Optional[int] = None
+        total_length: Optional[int] = None,
+        file_entries: Optional[List[Dict]] = None
     ):
         self.filename = filename
         self.piece_length = piece_length
@@ -40,7 +42,12 @@ class PieceManager:
         self._initialize_trackers()
 
         # Storage writer session
-        self.writer = DownloadSession(filename, piece_length, total_length=self.total_length)
+        self.writer = DownloadSession(
+            filename=filename,
+            piece_length=piece_length,
+            total_length=self.total_length,
+            file_entries=file_entries
+        )
         self.writer.initialize_file()
 
         # Tracking completed status
@@ -112,11 +119,6 @@ class PieceManager:
                 self.selector.mark_piece_failed(piece_idx)
 
     def get_next_request_for_peer(self, peer_id: str) -> Optional[bytes]:
-        """
-        Gets next block request payload for a specific peer:
-        1. Look for existing in-progress pieces that have pending blocks
-        2. Otherwise, pick the rarest available piece from this peer
-        """
         # First priority: complete pieces already in progress
         for piece_idx in list(self.selector.in_progress_pieces):
             if piece_idx in self.selector.peer_inventory.get(peer_id, set()):
