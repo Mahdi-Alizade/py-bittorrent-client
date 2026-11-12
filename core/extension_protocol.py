@@ -7,13 +7,14 @@ from core.parser import BDecoder, TorrentEncoder
 
 class ExtensionProtocol:
     """
-    Implements BEP-0010 (Extension Protocol) and BEP-0009 (ut_metadata)
-    to fetch the torrent 'info' dictionary directly from peers via magnet links.
+    Implements BEP-0010 (Extension Protocol), BEP-0009 (ut_metadata),
+    and BEP-0011 (ut_pex) handshake negotiation.
     """
 
     MSG_EXTENDED = 20
     HANDSHAKE_EXT_ID = 0
     LOCAL_UT_METADATA_ID = 1
+    LOCAL_UT_PEX_ID = 2
 
     # ut_metadata message types (BEP-0009)
     META_REQUEST = 0
@@ -24,10 +25,6 @@ class ExtensionProtocol:
 
     @staticmethod
     def build_reserved_bytes() -> bytes:
-        """
-        Builds 8-byte handshake reserved field with bit 20 set (byte[5] |= 0x10)
-        indicating support for BEP-0010 Extension Protocol.
-        """
         reserved = bytearray(8)
         reserved[5] |= 0x10
         return bytes(reserved)
@@ -41,12 +38,12 @@ class ExtensionProtocol:
     @classmethod
     def create_extension_handshake(cls) -> bytes:
         """
-        Creates BEP-0010 Extended Handshake payload advertising ut_metadata support.
-        Format: <len><id=20><ext_id=0><bencoded_dict>
+        Creates BEP-0010 Extended Handshake advertising both ut_metadata and ut_pex.
         """
         handshake_dict = {
             "m": {
-                "ut_metadata": cls.LOCAL_UT_METADATA_ID
+                "ut_metadata": cls.LOCAL_UT_METADATA_ID,
+                "ut_pex": cls.LOCAL_UT_PEX_ID
             }
         }
         encoded_payload = TorrentEncoder.encode(handshake_dict)
@@ -57,7 +54,7 @@ class ExtensionProtocol:
     @classmethod
     def parse_extension_handshake(cls, payload_bytes: bytes) -> Tuple[Optional[int], Optional[int]]:
         """
-        Parses peer's extended handshake payload (excluding 4-byte length prefix).
+        Parses peer's extended handshake payload.
         Returns (peer_ut_metadata_id, metadata_size).
         """
         if len(payload_bytes) < 2:
@@ -89,10 +86,44 @@ class ExtensionProtocol:
             return None, None
 
     @classmethod
+    def parse_extended_capabilities(cls, payload_bytes: bytes) -> dict:
+        """
+        Extracts full extension dictionary capabilities (ut_metadata, ut_pex, metadata_size).
+        """
+        result = {
+            "ut_metadata": None,
+            "ut_pex": None,
+            "metadata_size": None
+        }
+        if len(payload_bytes) < 2:
+            return result
+
+        if payload_bytes[0] != cls.MSG_EXTENDED or payload_bytes[1] != cls.HANDSHAKE_EXT_ID:
+            return result
+
+        try:
+            decoded = BDecoder(payload_bytes[2:]).decode()
+            if not isinstance(decoded, dict):
+                return result
+
+            m_dict = decoded.get(b"m") or decoded.get("m") or {}
+            meta_id = m_dict.get(b"ut_metadata") or m_dict.get("ut_metadata")
+            pex_id = m_dict.get(b"ut_pex") or m_dict.get("ut_pex")
+            meta_size = decoded.get(b"metadata_size") or decoded.get("metadata_size")
+
+            if meta_id is not None:
+                result["ut_metadata"] = int(meta_id)
+            if pex_id is not None:
+                result["ut_pex"] = int(pex_id)
+            if meta_size is not None:
+                result["metadata_size"] = int(meta_size)
+        except Exception:
+            pass
+
+        return result
+
+    @classmethod
     def create_metadata_request(cls, peer_ut_metadata_id: int, piece_index: int) -> bytes:
-        """
-        Builds a BEP-0009 metadata piece request message.
-        """
         req_dict = {
             "msg_type": cls.META_REQUEST,
             "piece": piece_index
@@ -104,9 +135,6 @@ class ExtensionProtocol:
 
     @classmethod
     def _find_bencoded_dict_end(cls, data: bytes) -> int:
-        """
-        Finds the exact byte offset where the leading bencoded dictionary ends.
-        """
         if not data or data[0:1] != b"d":
             return -1
 
@@ -142,10 +170,6 @@ class ExtensionProtocol:
 
     @classmethod
     def parse_metadata_message(cls, payload_bytes: bytes) -> Optional[Tuple[int, int, bytes]]:
-        """
-        Parses an incoming ut_metadata message (excluding 4-byte length prefix).
-        Returns (msg_type, piece_index, raw_metadata_chunk).
-        """
         if len(payload_bytes) < 2:
             return None
 
@@ -188,11 +212,6 @@ class ExtensionProtocol:
 
 
 class MetadataAssembler:
-    """
-    Collects 16KB metadata pieces from peers and verifies the assembled 'info'
-    dictionary against the target magnet info-hash.
-    """
-
     def __init__(self, expected_info_hash: bytes, metadata_size: int):
         self.expected_info_hash = expected_info_hash
         self.metadata_size = metadata_size
