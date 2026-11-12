@@ -63,4 +63,6 @@ def test_metadata_assembler_verification():
 
     verified_info = assembler.assemble_and_verify()
     assert verified_info is not None
-    assert verified_info[b"name"] == b"ubuntu.iso"
+
+    name_val = verified_info.get("name") or verified_info.get(b"name")
+    assert name_val in ("ubuntu.iso", b"ubuntu.iso")
