@@ -8,8 +8,10 @@ from pathlib import Path
 from colorama import Fore, Style, init
 
 from core.client_logic import BitTorrentClient
+from core.extension_protocol import ExtensionProtocol
 from core.magnet_parser import MagnetURIParser
 from core.parser import BDecoder, TorrentEncoder
+from core.torrent_creator import TorrentCreator
 
 init(autoreset=True)
 
@@ -20,15 +22,58 @@ def generate_peer_id() -> bytes:
     return f"-PY0001-{random_digits}".encode("ascii")
 
 
-def calculate_info_hash(info_dict: dict) -> bytes:
-    """Computes exact 20-byte SHA-1 hash of the bencoded info dictionary."""
-    encoded_info = TorrentEncoder.encode(info_dict)
+def calculate_info_hash_from_raw_torrent(raw_torrent_bytes: bytes, fallback_info: dict) -> bytes:
+    """
+    Computes exact 20-byte SHA-1 hash from the raw bencoded '4:info' dictionary slice
+    to preserve raw binary piece hashes without UTF-8 re-encoding distortion.
+    """
+    marker = b"4:info"
+    pos = raw_torrent_bytes.find(marker)
+    if pos != -1:
+        info_start = pos + len(marker)
+        dict_len = ExtensionProtocol._find_bencoded_dict_end(raw_torrent_bytes[info_start:])
+        if dict_len != -1:
+            raw_info_slice = raw_torrent_bytes[info_start:info_start + dict_len]
+            return hashlib.sha1(raw_info_slice).digest()
+
+    encoded_info = TorrentEncoder.encode(fallback_info)
     return hashlib.sha1(encoded_info).digest()
 
 
+def handle_create_mode(args):
+    source_path = args.create
+    output_path = args.out or f"{Path(source_path).name}.torrent"
+    tracker_list = args.tracker or []
+    piece_size_bytes = args.piece_size * 1024
+
+    print(f"{Fore.CYAN}=== Py-BitTorrent Creator ==={Style.RESET_ALL}")
+    print(f"[*] Source Path: {source_path}")
+    print(f"[*] Piece Size: {args.piece_size} KB")
+
+    try:
+        creator = TorrentCreator(
+            source_path=source_path,
+            trackers=tracker_list,
+            piece_length=piece_size_bytes
+        )
+        saved_file, info_hash, magnet_uri = creator.save_torrent_file(output_path)
+    except Exception as err:
+        print(f"{Fore.RED}[-] Failed to create torrent: {err}{Style.RESET_ALL}")
+        sys.exit(1)
+
+    print(f"{Fore.GREEN}[+] Torrent created successfully!{Style.RESET_ALL}")
+    print(f"[*] Saved File: {saved_file.resolve()}")
+    print(f"[*] Info Hash (Hex): {info_hash.hex()}")
+    print(f"{Fore.YELLOW}[*] Magnet URI:{Style.RESET_ALL}\n{magnet_uri}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Py-BitTorrent Client Engine.")
-    parser.add_argument("target", help="Path to a .torrent file or a magnet:? URI.")
+    parser = argparse.ArgumentParser(description="Py-BitTorrent Client & Creator Engine.")
+    parser.add_argument("target", nargs="?", help="Path to a .torrent file or a magnet:? URI.")
+    parser.add_argument("--create", type=str, help="Create a .torrent file and magnet URI from a file or folder.")
+    parser.add_argument("--out", type=str, help="Output .torrent file path when using --create.")
+    parser.add_argument("--tracker", action="append", help="Tracker announce URL(s) when using --create.")
+    parser.add_argument("--piece-size", type=int, default=256, help="Piece size in KB when using --create (default: 256).")
     parser.add_argument("--max-peers", type=int, default=25, help="Max peers to contact concurrently.")
     parser.add_argument("--port", type=int, default=6881, help="TCP port to listen for incoming peers.")
     parser.add_argument("--max-down", type=int, default=0, help="Max download speed limit in KB/s (0 = unlimited).")
@@ -36,6 +81,13 @@ def main():
     parser.add_argument("--seed", action="store_true", help="Continue seeding after download completes.")
     parser.add_argument("--no-dht", action="store_true", help="Disable decentralized Kademlia DHT peer discovery.")
     args = parser.parse_args()
+
+    if args.create:
+        handle_create_mode(args)
+        return
+
+    if not args.target:
+        parser.error("the following arguments are required: target (or use --create <path>)")
 
     target_input = args.target.strip()
     peer_id = generate_peer_id()
@@ -94,7 +146,7 @@ def main():
             print(f"{Fore.RED}[-] Malformed torrent: missing info dictionary{Style.RESET_ALL}")
             sys.exit(1)
 
-        info_hash = calculate_info_hash(info)
+        info_hash = calculate_info_hash_from_raw_torrent(raw_torrent_data, info)
         print(f"{Fore.GREEN}[+] Torrent parsed successfully!{Style.RESET_ALL}")
         print(f"[*] Info Hash (Hex): {info_hash.hex()}")
 
