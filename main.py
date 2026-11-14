@@ -22,6 +22,12 @@ def generate_peer_id() -> bytes:
     return f"-PY0001-{random_digits}".encode("ascii")
 
 
+def calculate_info_hash(info_dict: dict) -> bytes:
+    """Computes exact 20-byte SHA-1 hash of the bencoded info dictionary."""
+    encoded_info = TorrentEncoder.encode(info_dict)
+    return hashlib.sha1(encoded_info).digest()
+
+
 def calculate_info_hash_from_raw_torrent(raw_torrent_bytes: bytes, fallback_info: dict) -> bytes:
     """
     Computes exact 20-byte SHA-1 hash from the raw bencoded '4:info' dictionary slice
@@ -36,8 +42,7 @@ def calculate_info_hash_from_raw_torrent(raw_torrent_bytes: bytes, fallback_info
             raw_info_slice = raw_torrent_bytes[info_start:info_start + dict_len]
             return hashlib.sha1(raw_info_slice).digest()
 
-    encoded_info = TorrentEncoder.encode(fallback_info)
-    return hashlib.sha1(encoded_info).digest()
+    return calculate_info_hash(fallback_info)
 
 
 def handle_create_mode(args):
