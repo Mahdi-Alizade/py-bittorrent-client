@@ -11,7 +11,9 @@ from core.client_logic import BitTorrentClient
 from core.extension_protocol import ExtensionProtocol
 from core.magnet_parser import MagnetURIParser
 from core.parser import BDecoder, TorrentEncoder
+from core.session_manager import MultiTorrentSessionManager
 from core.torrent_creator import TorrentCreator
+from core.web_dashboard import WebControlServer
 
 init(autoreset=True)
 
@@ -72,9 +74,51 @@ def handle_create_mode(args):
     print(f"{Fore.YELLOW}[*] Magnet URI:{Style.RESET_ALL}\n{magnet_uri}")
 
 
+async def run_daemon_mode(args, peer_id: bytes, use_dht: bool):
+    session_mgr = MultiTorrentSessionManager(
+        peer_id=peer_id,
+        listen_port=args.port,
+        enable_dht=use_dht,
+        enable_lpd=True,
+        max_peers_per_torrent=args.max_peers
+    )
+    session_mgr.start_background_services()
+
+    web_server = WebControlServer(
+        session_manager=session_mgr,
+        host="127.0.0.1",
+        port=args.web_port
+    )
+    bound_web_port = await web_server.start()
+
+    print(f"{Fore.CYAN}=== Py-BitTorrent Multi-Torrent Daemon ==={Style.RESET_ALL}")
+    print(f"{Fore.GREEN}[+] Web Control Dashboard: http://127.0.0.1:{bound_web_port}{Style.RESET_ALL}")
+    print(f"[*] P2P Listen Port: {args.port} | DHT: {'ON' if use_dht else 'OFF'} | LPD: ON")
+
+    if args.target:
+        target_str = args.target.strip()
+        if target_str.startswith("magnet:?"):
+            await session_mgr.add_magnet_uri(target_str)
+        else:
+            await session_mgr.add_torrent_file(target_str)
+
+    try:
+        while True:
+            await asyncio.sleep(2.0)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print(f"\n{Fore.YELLOW}[*] Shutting down daemon cleanly...{Style.RESET_ALL}")
+    finally:
+        for hex_id in list(session_mgr.sessions.keys()):
+            await session_mgr.pause_torrent(hex_id)
+        session_mgr.stop_background_services()
+        await web_server.stop()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Py-BitTorrent Client & Creator Engine.")
+    parser = argparse.ArgumentParser(description="Py-BitTorrent Enterprise Client & Creator Engine.")
     parser.add_argument("target", nargs="?", help="Path to a .torrent file or a magnet:? URI.")
+    parser.add_argument("--daemon", action="store_true", help="Run multi-torrent engine with live Web Control Dashboard.")
+    parser.add_argument("--web-port", type=int, default=8080, help="HTTP port for the Web Control Dashboard (default: 8080).")
     parser.add_argument("--create", type=str, help="Create a .torrent file and magnet URI from a file or folder.")
     parser.add_argument("--out", type=str, help="Output .torrent file path when using --create.")
     parser.add_argument("--tracker", action="append", help="Tracker announce URL(s) when using --create.")
@@ -91,13 +135,20 @@ def main():
         handle_create_mode(args)
         return
 
-    if not args.target:
-        parser.error("the following arguments are required: target (or use --create <path>)")
-
-    target_input = args.target.strip()
     peer_id = generate_peer_id()
     use_dht = not args.no_dht
 
+    if args.daemon:
+        try:
+            asyncio.run(run_daemon_mode(args, peer_id=peer_id, use_dht=use_dht))
+        except KeyboardInterrupt:
+            pass
+        return
+
+    if not args.target:
+        parser.error("the following arguments are required: target (or use --daemon / --create <path>)")
+
+    target_input = args.target.strip()
     max_down_bytes = args.max_down * 1024 if args.max_down > 0 else None
     max_up_bytes = args.max_up * 1024 if args.max_up > 0 else None
 
