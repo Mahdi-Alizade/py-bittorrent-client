@@ -7,6 +7,7 @@ from core.block_picker import BlockState, PieceBlockTracker
 from core.piece_selector import RarestFirstSelector
 from core.protocol_messages import TorrentMessage
 from core.reassemble import DownloadSession
+from core.resume_manager import ResumeStateManager
 
 init(autoreset=True)
 
@@ -14,7 +15,8 @@ init(autoreset=True)
 class PieceManager:
     """
     Coordinates piece downloading, block pipelining, rarest-first selection,
-    End-Game Mode cancellation broadcasts, and outbound block serving (Seeding).
+    End-Game Mode cancellation broadcasts, outbound block serving (Seeding),
+    and Fast-Resume state persistence.
     """
 
     def __init__(
@@ -23,7 +25,9 @@ class PieceManager:
         piece_length: int,
         num_pieces: int,
         total_length: Optional[int] = None,
-        file_entries: Optional[List[Dict]] = None
+        file_entries: Optional[List[Dict]] = None,
+        info_hash_hex: Optional[str] = None,
+        resume_dir: str = "downloads/.resume"
     ):
         self.filename = filename
         self.piece_length = piece_length
@@ -51,6 +55,42 @@ class PieceManager:
 
         self.have_pieces: List[bool] = [False] * num_pieces
         self.endgame_requests: Dict[Tuple[int, int], List[str]] = {}
+
+        # Optional Fast-Resume persistence manager
+        self.resume_manager: Optional[ResumeStateManager] = None
+        if info_hash_hex:
+            self.resume_manager = ResumeStateManager(info_hash_hex=info_hash_hex, state_dir=resume_dir)
+            self._restore_resume_state()
+
+    def _restore_resume_state(self):
+        if self.resume_manager is None:
+            return
+
+        restored = self.resume_manager.load_state(expected_num_pieces=self.num_pieces)
+        if restored is None:
+            return
+
+        restored_count = 0
+        for idx, is_done in enumerate(restored):
+            if is_done:
+                self.have_pieces[idx] = True
+                self.selector.mark_piece_completed(idx)
+                self.writer.completed_pieces.append(idx)
+                restored_count += 1
+
+        if restored_count > 0:
+            print(
+                f"{Fore.GREEN}[+] Fast-Resume restored {restored_count}/{self.num_pieces} "
+                f"completed pieces from previous session.{Style.RESET_ALL}"
+            )
+
+    def _persist_resume_state(self):
+        if self.resume_manager is not None:
+            self.resume_manager.save_state(
+                filename=self.filename,
+                num_pieces=self.num_pieces,
+                have_pieces=self.have_pieces
+            )
 
     def _initialize_trackers(self):
         for piece_idx in range(self.num_pieces):
@@ -87,9 +127,6 @@ class PieceManager:
         self.selector.record_peer_bitfield(peer_id, bitfield_bytes)
 
     def build_local_bitfield_message(self) -> Optional[bytes]:
-        """
-        Builds a BEP-3 Bitfield wire message if we have at least one completed piece.
-        """
         if not any(self.have_pieces):
             return None
 
@@ -107,9 +144,6 @@ class PieceManager:
         return header + bytes(bitfield_arr)
 
     def serve_block_request(self, piece_idx: int, offset: int, length: int) -> Optional[bytes]:
-        """
-        Reads a block from a completed piece and formats a wire MSG_PIECE packet.
-        """
         if not (0 <= piece_idx < self.num_pieces):
             return None
         if not self.have_pieces[piece_idx]:
@@ -177,6 +211,7 @@ class PieceManager:
             if is_valid:
                 self.have_pieces[piece_idx] = True
                 self.selector.mark_piece_completed(piece_idx)
+                self._persist_resume_state()
                 print(f"{Fore.GREEN}[+] SUCCESS: Piece #{piece_idx} validated and saved.{Style.RESET_ALL}")
             else:
                 print(f"{Fore.RED}[-] Piece #{piece_idx} verification failed. Resetting blocks.{Style.RESET_ALL}")
