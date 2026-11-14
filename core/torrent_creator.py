@@ -2,7 +2,7 @@ import hashlib
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.parser import TorrentEncoder
 
@@ -35,11 +35,22 @@ class TorrentCreator:
         self.comment = comment
         self.created_by = created_by
 
+    @classmethod
+    def _canonicalize_bencode_obj(cls, obj: Any) -> Any:
+        """
+        Recursively sorts dictionary keys in lexicographical order
+        to guarantee canonical BEP-3 bencoding and deterministic info_hash.
+        """
+        if isinstance(obj, dict):
+            sorted_dict = {}
+            for k in sorted(obj.keys(), key=lambda x: x.encode("utf-8") if isinstance(x, str) else x):
+                sorted_dict[k] = cls._canonicalize_bencode_obj(obj[k])
+            return sorted_dict
+        elif isinstance(obj, list):
+            return [cls._canonicalize_bencode_obj(item) for item in obj]
+        return obj
+
     def _collect_files(self) -> Tuple[List[Path], List[Dict]]:
-        """
-        Collects physical file paths and builds BEP-3 'files' metadata entries
-        sorted deterministically by relative path.
-        """
         if self.source.is_file():
             return [self.source], []
 
@@ -64,10 +75,6 @@ class TorrentCreator:
         return all_files, file_entries
 
     def _compute_pieces_hashes(self, ordered_files: List[Path]) -> bytes:
-        """
-        Streams bytes across all constituent files and computes concatenated
-        20-byte SHA-1 hashes for every piece boundary.
-        """
         pieces_buffer = bytearray()
         current_chunk = bytearray()
 
@@ -85,7 +92,6 @@ class TorrentCreator:
                         pieces_buffer.extend(digest)
                         current_chunk.clear()
 
-        # Hash final trailing piece if any bytes remain
         if len(current_chunk) > 0:
             digest = hashlib.sha1(current_chunk).digest()
             pieces_buffer.extend(digest)
@@ -93,40 +99,38 @@ class TorrentCreator:
         return bytes(pieces_buffer)
 
     def build_metainfo(self) -> Tuple[dict, bytes, str]:
-        """
-        Builds the complete metainfo dictionary, computes its 20-byte info_hash,
-        and generates the corresponding magnet:? URI.
-        Returns (metainfo_dict, info_hash_bytes, magnet_uri).
-        """
         ordered_files, file_entries = self._collect_files()
         pieces_concat = self._compute_pieces_hashes(ordered_files)
 
-        info_dict: Dict = {
+        raw_info_dict: Dict = {
             "name": self.source.name,
             "piece length": self.piece_length,
             "pieces": pieces_concat
         }
 
         if self.source.is_file():
-            info_dict["length"] = self.source.stat().st_size
+            raw_info_dict["length"] = self.source.stat().st_size
         else:
-            info_dict["files"] = file_entries
+            raw_info_dict["files"] = file_entries
 
+        info_dict = self._canonicalize_bencode_obj(raw_info_dict)
         encoded_info = TorrentEncoder.encode(info_dict)
         info_hash = hashlib.sha1(encoded_info).digest()
 
-        metainfo: Dict = {
+        raw_metainfo: Dict = {
             "info": info_dict,
             "creation date": int(time.time()),
             "created by": self.created_by
         }
 
         if self.trackers:
-            metainfo["announce"] = self.trackers[0]
-            metainfo["announce-list"] = [[tr] for tr in self.trackers]
+            raw_metainfo["announce"] = self.trackers[0]
+            raw_metainfo["announce-list"] = [[tr] for tr in self.trackers]
 
         if self.comment:
-            metainfo["comment"] = self.comment
+            raw_metainfo["comment"] = self.comment
+
+        metainfo = self._canonicalize_bencode_obj(raw_metainfo)
 
         magnet_uri = self.generate_magnet_uri(
             info_hash=info_hash,
@@ -137,10 +141,6 @@ class TorrentCreator:
         return metainfo, info_hash, magnet_uri
 
     def save_torrent_file(self, output_path: str) -> Tuple[Path, bytes, str]:
-        """
-        Encodes and writes the .torrent file to disk.
-        Returns (saved_path, info_hash_bytes, magnet_uri).
-        """
         metainfo, info_hash, magnet_uri = self.build_metainfo()
         encoded_torrent = TorrentEncoder.encode(metainfo)
 
