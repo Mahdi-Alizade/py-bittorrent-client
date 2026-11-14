@@ -26,6 +26,7 @@ class BitTorrentClient:
     - Peer Exchange (BEP-0011) & Kademlia DHT (BEP-0005)
     - Incoming TCP listener & Tit-for-Tat choking/seeding engine
     - Token Bucket rate limiting & real-time speed/ETA telemetry
+    - Fast-Resume state persistence across restarts
     """
 
     def __init__(
@@ -509,7 +510,8 @@ class BitTorrentClient:
             piece_length=self.piece_length,
             num_pieces=self.num_pieces,
             total_length=self.total_length,
-            file_entries=self.file_entries
+            file_entries=self.file_entries,
+            info_hash_hex=raw_info_hash.hex()
         )
         manager.writer.piece_hashes = self.piece_hashes
 
