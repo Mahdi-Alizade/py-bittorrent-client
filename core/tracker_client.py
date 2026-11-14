@@ -26,6 +26,11 @@ class TrackerClient:
         self.peer_id = peer_id
         self.timeout = timeout
 
+    @staticmethod
+    def parse_compact_peers(compact_bytes: bytes) -> List[Tuple[str, int]]:
+        """Decodes compact 6-byte peer chunks into (ip, port) tuples."""
+        return PeerExchangeProtocol.decode_compact_peers(compact_bytes)
+
     def announce(
         self,
         tracker_url: str,
@@ -106,9 +111,9 @@ class TrackerClient:
             peers_list: List[Tuple[str, int]] = []
 
             if isinstance(raw_peers, bytes):
-                peers_list = PeerExchangeProtocol.decode_compact_peers(raw_peers)
+                peers_list = self.parse_compact_peers(raw_peers)
             elif isinstance(raw_peers, str):
-                peers_list = PeerExchangeProtocol.decode_compact_peers(raw_peers.encode("latin-1"))
+                peers_list = self.parse_compact_peers(raw_peers.encode("latin-1"))
             elif isinstance(raw_peers, list):
                 for entry in raw_peers:
                     if isinstance(entry, dict):
