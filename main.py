@@ -30,6 +30,8 @@ def main():
     parser = argparse.ArgumentParser(description="Py-BitTorrent Client Engine.")
     parser.add_argument("target", help="Path to a .torrent file or a magnet:? URI.")
     parser.add_argument("--max-peers", type=int, default=25, help="Max peers to contact concurrently.")
+    parser.add_argument("--port", type=int, default=6881, help="TCP port to listen for incoming peers.")
+    parser.add_argument("--seed", action="store_true", help="Continue seeding after download completes.")
     parser.add_argument("--no-dht", action="store_true", help="Disable decentralized Kademlia DHT peer discovery.")
     args = parser.parse_args()
 
@@ -39,7 +41,7 @@ def main():
 
     print(f"{Fore.CYAN}=== Py-BitTorrent Client ==={Style.RESET_ALL}")
     print(f"[*] Peer ID: {peer_id.decode('latin-1', errors='replace')}")
-    print(f"[*] Kademlia DHT: {'ENABLED' if use_dht else 'DISABLED'}")
+    print(f"[*] Listen Port: {args.port} | Kademlia DHT: {'ENABLED' if use_dht else 'DISABLED'}")
 
     if target_input.startswith("magnet:?"):
         try:
@@ -87,8 +89,13 @@ def main():
         print(f"{Fore.GREEN}[+] Torrent parsed successfully!{Style.RESET_ALL}")
         print(f"[*] Info Hash (Hex): {info_hash.hex()}")
 
-    client = BitTorrentClient(metadata, enable_dht=use_dht)
-    client.start_download_loop(raw_info_hash=info_hash, my_peer_id=peer_id, max_peers=args.max_peers)
+    client = BitTorrentClient(metadata, enable_dht=use_dht, listen_port=args.port)
+    client.start_download_loop(
+        raw_info_hash=info_hash,
+        my_peer_id=peer_id,
+        max_peers=args.max_peers,
+        seed_after_download=args.seed
+    )
 
 
 if __name__ == "__main__":
