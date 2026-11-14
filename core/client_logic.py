@@ -1,8 +1,10 @@
 import asyncio
+import struct
 from typing import Dict, List, Optional, Set, Tuple
 from colorama import Fore, Style, init
 
-from core.async_peer import AsyncPeerConnection
+from core.async_peer import AsyncPeerConnection, PROTOCOL_IDENTIFIER
+from core.choking_manager import TitForTatChoker
 from core.dht_client import DHTCrawler
 from core.extension_protocol import ExtensionProtocol, MetadataAssembler
 from core.magnet_parser import MagnetLinkData
@@ -16,14 +18,18 @@ init(autoreset=True)
 
 class BitTorrentClient:
     """
-    Asynchronous BitTorrent client orchestrating parallel peer workers,
-    pipelined block downloads, rarest-first scheduling, End-Game mode,
-    Magnet link metadata resolution, live Peer Exchange (PEX), and Kademlia DHT.
+    Full bidirectional BitTorrent node (Leecher & Seeder) supporting:
+    - Parallel async peer workers with block pipelining
+    - Rarest-First piece selection & End-Game mode
+    - Magnet URI resolution (BEP-0009 / BEP-0010)
+    - Peer Exchange (BEP-0011) & Kademlia DHT (BEP-0005)
+    - Incoming TCP listener & Tit-for-Tat choking/seeding engine
     """
 
-    def __init__(self, torrent_metadata: dict, enable_dht: bool = True):
+    def __init__(self, torrent_metadata: dict, enable_dht: bool = True, listen_port: int = 6881):
         self.metadata = torrent_metadata
         self.enable_dht = enable_dht
+        self.listen_port = listen_port
         self.info_block = torrent_metadata.get(b"info") or torrent_metadata.get("info")
 
         if not self.info_block:
@@ -78,6 +84,9 @@ class BitTorrentClient:
         self.active_connections: Dict[str, AsyncPeerConnection] = {}
         self.known_peers: Set[Tuple[str, int]] = set()
         self.worker_tasks: List[asyncio.Task] = []
+        self.choker = TitForTatChoker(max_unchoked_slots=4)
+        self._incoming_server: Optional[asyncio.AbstractServer] = None
+        self.bound_port: Optional[int] = None
 
     @classmethod
     async def fetch_metadata_from_magnet(
@@ -87,10 +96,6 @@ class BitTorrentClient:
         peer_list: Optional[List] = None,
         use_dht: bool = True
     ) -> Optional[dict]:
-        """
-        Resolves full torrent metadata dictionary by contacting peers over BEP-0010/BEP-0009,
-        combining peers from both Trackers and Kademlia DHT.
-        """
         print(f"{Fore.CYAN}[*] Resolving metadata for magnet: {magnet_data.display_name}{Style.RESET_ALL}")
 
         peers_to_try = list(peer_list) if peer_list else []
@@ -106,7 +111,6 @@ class BitTorrentClient:
                 if len(peers_to_try) >= 15:
                     break
 
-        # Fallback or supplement via Kademlia DHT if needed
         if len(peers_to_try) < 5 and use_dht:
             print(f"{Fore.CYAN}[*] Querying Kademlia DHT network for peers...{Style.RESET_ALL}")
             dht_crawler = DHTCrawler(local_id=my_peer_id)
@@ -180,6 +184,114 @@ class BitTorrentClient:
 
         return None
 
+    async def start_incoming_listener(
+        self,
+        raw_info_hash: bytes,
+        my_peer_id: bytes,
+        manager: PieceManager,
+        host: str = "0.0.0.0",
+        port: Optional[int] = None,
+        max_peers: int = 25
+    ) -> Optional[int]:
+        """
+        Starts an asynchronous TCP server accepting incoming peer connections
+        and handling their BEP-3 handshakes and block requests.
+        """
+        target_port = self.listen_port if port is None else port
+
+        async def handle_incoming_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+            peer_addr = writer.get_extra_info("peername")
+            ip = peer_addr[0] if peer_addr else "unknown"
+            remote_port = peer_addr[1] if peer_addr else 0
+            peer_tag = f"{ip}:{remote_port}"
+
+            try:
+                hs_bytes = await asyncio.wait_for(reader.readexactly(68), timeout=5.0)
+                pstrlen = hs_bytes[0]
+                pstr = hs_bytes[1:1 + pstrlen]
+                resp_reserved = hs_bytes[1 + pstrlen:1 + pstrlen + 8]
+                req_info_hash = hs_bytes[1 + pstrlen + 8:1 + pstrlen + 28]
+
+                if pstr != PROTOCOL_IDENTIFIER or req_info_hash != raw_info_hash:
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+
+                # Reply with our handshake
+                our_reserved = ExtensionProtocol.build_reserved_bytes()
+                reply_hs = struct.pack(
+                    ">B19s8s20s20s",
+                    len(PROTOCOL_IDENTIFIER),
+                    PROTOCOL_IDENTIFIER,
+                    our_reserved,
+                    raw_info_hash,
+                    my_peer_id
+                )
+                writer.write(reply_hs)
+                await writer.drain()
+
+                peer_conn = AsyncPeerConnection(ip, remote_port, raw_info_hash, my_peer_id)
+                peer_conn.reader = reader
+                peer_conn.writer = writer
+                peer_conn.is_connected = True
+                peer_conn.supports_extensions = ExtensionProtocol.peer_supports_extensions(resp_reserved)
+
+                await self._run_peer_session(
+                    peer_conn=peer_conn,
+                    peer_tag=peer_tag,
+                    raw_info_hash=raw_info_hash,
+                    my_peer_id=my_peer_id,
+                    manager=manager,
+                    max_peers=max_peers,
+                    stop_when_complete=False
+                )
+            except Exception:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        try:
+            self._incoming_server = await asyncio.start_server(handle_incoming_peer, host, target_port)
+            if self._incoming_server.sockets:
+                self.bound_port = self._incoming_server.sockets[0].getsockname()[1]
+            print(f"{Fore.GREEN}[+] Incoming P2P TCP listener active on port {self.bound_port}{Style.RESET_ALL}")
+            return self.bound_port
+        except Exception as exc:
+            print(f"{Fore.YELLOW}[!] Could not bind incoming listener on port {target_port}: {exc}{Style.RESET_ALL}")
+            return None
+
+    async def stop_incoming_listener(self):
+        if self._incoming_server is not None:
+            self._incoming_server.close()
+            await self._incoming_server.wait_closed()
+            self._incoming_server = None
+
+    async def _choking_scheduler_loop(self, manager: PieceManager, interval: float = 10.0):
+        """
+        Periodically runs Tit-for-Tat evaluation and dispatches CHOKE / UNCHOKE
+        wire messages to connected peers.
+        """
+        try:
+            while True:
+                is_seeding = all(manager.have_pieces)
+                decisions = self.choker.evaluate_choke_decisions(is_seeding_mode=is_seeding)
+
+                for peer_tag, should_choke in decisions.items():
+                    conn = self.active_connections.get(peer_tag)
+                    if conn is None or not conn.is_connected:
+                        continue
+
+                    if should_choke:
+                        await conn.send_message(TorrentMessage.create_choke())
+                    else:
+                        await conn.send_message(TorrentMessage.create_unchoke())
+
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+
     def _spawn_peer_worker_if_new(
         self,
         ip: str,
@@ -225,19 +337,51 @@ class BitTorrentClient:
         if not connected:
             return
 
+        await self._run_peer_session(
+            peer_conn=peer_conn,
+            peer_tag=peer_tag,
+            raw_info_hash=raw_info_hash,
+            my_peer_id=my_peer_id,
+            manager=manager,
+            max_peers=max_peers,
+            pipeline_depth=pipeline_depth,
+            stop_when_complete=True
+        )
+
+    async def _run_peer_session(
+        self,
+        peer_conn: AsyncPeerConnection,
+        peer_tag: str,
+        raw_info_hash: bytes,
+        my_peer_id: bytes,
+        manager: PieceManager,
+        max_peers: int = 25,
+        pipeline_depth: int = 4,
+        stop_when_complete: bool = True
+    ):
         self.active_connections[peer_tag] = peer_conn
         manager.register_peer(peer_tag)
-        print(f"{Fore.GREEN}[+] Worker active for peer {peer_tag}{Style.RESET_ALL}")
+        self.choker.register_peer(peer_tag)
+        print(f"{Fore.GREEN}[+] Bidirectional session active for peer {peer_tag}{Style.RESET_ALL}")
 
         try:
             if peer_conn.supports_extensions:
                 ext_hs = ExtensionProtocol.create_extension_handshake()
                 await peer_conn.send_message(ext_hs)
 
-            await peer_conn.send_message(TorrentMessage.create_interested())
+            # Advertise our available pieces via bitfield if we have any
+            local_bf = manager.build_local_bitfield_message()
+            if local_bf is not None:
+                await peer_conn.send_message(local_bf)
 
-            while not all(manager.have_pieces):
-                if not peer_conn.is_choked:
+            if not all(manager.have_pieces):
+                await peer_conn.send_message(TorrentMessage.create_interested())
+
+            while True:
+                if stop_when_complete and all(manager.have_pieces):
+                    break
+
+                if not peer_conn.is_choked and not all(manager.have_pieces):
                     for _ in range(pipeline_depth):
                         req_packet = manager.get_next_request_for_peer(peer_tag)
                         if req_packet is not None:
@@ -270,6 +414,16 @@ class BitTorrentClient:
                     peer_conn.is_choked = True
                     print(f"{Fore.LIGHTYELLOW_EX}[<-] Choked by peer {peer_tag}{Style.RESET_ALL}")
 
+                elif msg_id == TorrentMessage.MSG_INTERESTED:
+                    self.choker.set_peer_interested(peer_tag, True)
+                    # Trigger immediate evaluation if slots are available
+                    decisions = self.choker.evaluate_choke_decisions(is_seeding_mode=all(manager.have_pieces))
+                    if not decisions.get(peer_tag, True):
+                        await peer_conn.send_message(TorrentMessage.create_unchoke())
+
+                elif msg_id == TorrentMessage.MSG_NOT_INTERESTED:
+                    self.choker.set_peer_interested(peer_tag, False)
+
                 elif msg_id == TorrentMessage.MSG_HAVE:
                     piece_idx = TorrentMessage.parse_have(raw_msg)
                     if piece_idx is not None:
@@ -279,8 +433,32 @@ class BitTorrentClient:
                     bitfield_data = raw_msg[5:]
                     manager.handle_peer_bitfield(peer_tag, bitfield_data)
 
+                elif msg_id == TorrentMessage.MSG_REQUEST:
+                    if len(raw_msg) >= 17:
+                        stats = self.choker.peer_stats.get(peer_tag)
+                        if stats is not None and not stats.am_choking_peer:
+                            req_piece, req_offset, req_len = struct.unpack(">III", raw_msg[5:17])
+                            piece_pkt = manager.serve_block_request(req_piece, req_offset, req_len)
+                            if piece_pkt is not None:
+                                sent = await peer_conn.send_message(piece_pkt)
+                                if sent:
+                                    self.choker.record_bytes_to_peer(peer_tag, req_len)
+
                 elif msg_id == TorrentMessage.MSG_PIECE:
+                    if len(raw_msg) > 13:
+                        self.choker.record_bytes_from_peer(peer_tag, len(raw_msg) - 13)
+
+                    was_complete = list(manager.have_pieces)
                     cancel_tasks = manager.handle_message(raw_msg, source_peer_id=peer_tag)
+
+                    # Broadcast HAVE message to neighbors for any newly completed piece
+                    for idx, now_have in enumerate(manager.have_pieces):
+                        if now_have and not was_complete[idx]:
+                            have_pkt = TorrentMessage.create_have(idx)
+                            for conn in list(self.active_connections.values()):
+                                if conn.is_connected:
+                                    await conn.send_message(have_pkt)
+
                     for target_peer, cancel_pkt in cancel_tasks:
                         target_conn = self.active_connections.get(target_peer)
                         if target_conn is not None:
@@ -303,9 +481,10 @@ class BitTorrentClient:
                                 )
 
         except Exception as err:
-            print(f"{Fore.RED}[!] Peer worker error ({peer_tag}): {err}{Style.RESET_ALL}")
+            print(f"{Fore.RED}[!] Peer session error ({peer_tag}): {err}{Style.RESET_ALL}")
         finally:
             self.active_connections.pop(peer_tag, None)
+            self.choker.unregister_peer(peer_tag)
             manager.unregister_peer(peer_tag)
             await peer_conn.close()
 
@@ -313,7 +492,8 @@ class BitTorrentClient:
         self,
         raw_info_hash: bytes,
         my_peer_id: bytes,
-        max_peers: int = 25
+        max_peers: int = 25,
+        seed_after_download: bool = False
     ):
         mode_label = "Multi-File" if len(self.file_entries) > 0 else "Single-File"
         print(f"\n{Fore.YELLOW}[*] Launching Async Engine ({mode_label}) for '{self.target_filename}'...{Style.RESET_ALL}")
@@ -328,6 +508,16 @@ class BitTorrentClient:
         )
         manager.writer.piece_hashes = self.piece_hashes
 
+        await self.start_incoming_listener(
+            raw_info_hash=raw_info_hash,
+            my_peer_id=my_peer_id,
+            manager=manager,
+            port=self.listen_port,
+            max_peers=max_peers
+        )
+
+        choker_task = asyncio.create_task(self._choking_scheduler_loop(manager, interval=10.0))
+
         tracker_url = self.metadata.get(b"announce") or self.metadata.get("announce")
         if isinstance(tracker_url, bytes):
             tracker_url = tracker_url.decode("utf-8", errors="ignore")
@@ -335,10 +525,13 @@ class BitTorrentClient:
         discovered_peers: List[Tuple[str, int]] = []
         if tracker_url:
             tracker = TrackerClient(raw_info_hash, my_peer_id)
-            announce_data = tracker.announce(tracker_url, left=self.total_length)
+            announce_data = tracker.announce(
+                tracker_url,
+                port=self.bound_port or self.listen_port,
+                left=self.total_length
+            )
             discovered_peers = announce_data.get("peers", [])
 
-        # Supplement peer pool with Kademlia DHT lookup if enabled
         if self.enable_dht and len(discovered_peers) < max_peers:
             print(f"{Fore.CYAN}[*] Searching Kademlia DHT for additional swarm peers...{Style.RESET_ALL}")
             dht_crawler = DHTCrawler(local_id=my_peer_id)
@@ -361,6 +554,8 @@ class BitTorrentClient:
         self.worker_tasks.clear()
 
         for peer_ip, peer_port in discovered_peers[:max_peers]:
+            if peer_ip == "127.0.0.1" and peer_port == self.bound_port:
+                continue
             self._spawn_peer_worker_if_new(
                 ip=peer_ip,
                 port=peer_port,
@@ -377,7 +572,7 @@ class BitTorrentClient:
                     all_done = False
                     break
 
-            if all_done:
+            if all_done and len(self.active_connections) == 0:
                 print(f"{Fore.RED}[-] All active workers finished or disconnected.{Style.RESET_ALL}")
                 break
 
@@ -385,19 +580,36 @@ class BitTorrentClient:
             status_tag = " [END-GAME]" if manager.is_endgame_active() else ""
             print(f"{Fore.CYAN}[*] Download Progress{status_tag} (Swarm: {len(self.known_peers)} peers): {manager.status_report()}{Style.RESET_ALL}")
 
+        if seed_after_download and all(manager.have_pieces):
+            print(f"{Fore.GREEN}[*] Download complete! Entering Seeding mode (Ctrl+C to stop)...{Style.RESET_ALL}")
+            try:
+                while True:
+                    await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                pass
+
+        choker_task.cancel()
         for t in self.worker_tasks:
             if not t.done():
                 t.cancel()
+        await self.stop_incoming_listener()
 
         print(f"\n{Fore.GREEN}=== DOWNLOAD SESSION COMPLETED ==={Style.RESET_ALL}")
         print(f"Status: {manager.status_report()}")
         print(f"Output Path: {manager.writer.final_path.resolve()}")
 
-    def start_download_loop(self, raw_info_hash: bytes, my_peer_id: bytes, max_peers: int = 25):
+    def start_download_loop(
+        self,
+        raw_info_hash: bytes,
+        my_peer_id: bytes,
+        max_peers: int = 25,
+        seed_after_download: bool = False
+    ):
         asyncio.run(
             self.start_async_download(
                 raw_info_hash=raw_info_hash,
                 my_peer_id=my_peer_id,
-                max_peers=max_peers
+                max_peers=max_peers,
+                seed_after_download=seed_after_download
             )
         )
