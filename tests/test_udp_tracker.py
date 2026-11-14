@@ -2,6 +2,7 @@ import socket
 import struct
 import threading
 from core.pex_protocol import PeerExchangeProtocol
+from core.tracker_client import TrackerClient
 from core.udp_tracker import UDPTrackerClient
 
 
@@ -39,7 +40,6 @@ def test_udp_tracker_full_local_handshake():
 
     def mock_udp_tracker_server():
         try:
-            # 1. Handle Connect packet
             data1, addr1 = sock.recvfrom(1024)
             _, action1, tx1 = struct.unpack(">QII", data1[:16])
             assert action1 == UDPTrackerClient.ACTION_CONNECT
@@ -47,7 +47,6 @@ def test_udp_tracker_full_local_handshake():
             reply1 = struct.pack(">IIQ", UDPTrackerClient.ACTION_CONNECT, tx1, conn_id)
             sock.sendto(reply1, addr1)
 
-            # 2. Handle Announce packet
             data2, addr2 = sock.recvfrom(1024)
             rx_conn_id, action2, tx2 = struct.unpack(">QII", data2[:16])
             assert rx_conn_id == conn_id
@@ -61,8 +60,9 @@ def test_udp_tracker_full_local_handshake():
     t = threading.Thread(target=mock_udp_tracker_server, daemon=True)
     t.start()
 
-    client = UDPTrackerClient(info_hash=info_hash, peer_id=peer_id, timeout=1.5)
-    result = client.announce(f"udp://127.0.0.1:{server_port}/announce", port=6881, left=4096)
+    # Test unified TrackerClient routing for udp:// scheme
+    unified_tracker = TrackerClient(info_hash=info_hash, peer_id=peer_id, timeout=1.5)
+    result = unified_tracker.announce(f"udp://127.0.0.1:{server_port}/announce", port=6881, left=4096)
 
     assert result["peers"] == expected_peers
     assert result["seeders"] == 45
