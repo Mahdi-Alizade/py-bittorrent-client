@@ -1,6 +1,6 @@
 import math
 import struct
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from colorama import Fore, Style, init
 
 from core.block_picker import BlockState, PieceBlockTracker
@@ -16,7 +16,7 @@ class PieceManager:
     """
     Coordinates piece downloading, block pipelining, rarest-first selection,
     End-Game Mode cancellation broadcasts, outbound block serving (Seeding),
-    and Fast-Resume state persistence.
+    contributor tracking for anti-poisoning, and Fast-Resume persistence.
     """
 
     def __init__(
@@ -55,8 +55,9 @@ class PieceManager:
 
         self.have_pieces: List[bool] = [False] * num_pieces
         self.endgame_requests: Dict[Tuple[int, int], List[str]] = {}
+        self.piece_contributors: Dict[int, Set[str]] = {}
+        self.last_corrupt_peers: List[str] = []
 
-        # Optional Fast-Resume persistence manager
         self.resume_manager: Optional[ResumeStateManager] = None
         if info_hash_hex:
             self.resume_manager = ResumeStateManager(info_hash_hex=info_hash_hex, state_dir=resume_dir)
@@ -174,6 +175,7 @@ class PieceManager:
 
     def handle_message(self, raw_data: bytes, source_peer_id: Optional[str] = None) -> List[Tuple[str, bytes]]:
         cancel_notifications: List[Tuple[str, bytes]] = []
+        self.last_corrupt_peers.clear()
 
         if len(raw_data) < 5:
             return cancel_notifications
@@ -184,7 +186,7 @@ class PieceManager:
             parsed = TorrentMessage.parse_piece(raw_data)
             if parsed is not None:
                 piece_idx, offset, block_data = parsed
-                self._store_block(piece_idx, offset, block_data)
+                self._store_block(piece_idx, offset, block_data, source_peer_id=source_peer_id)
 
                 block_key = (piece_idx, offset)
                 if block_key in self.endgame_requests:
@@ -196,7 +198,7 @@ class PieceManager:
 
         return cancel_notifications
 
-    def _store_block(self, piece_idx: int, offset: int, block_data: bytes):
+    def _store_block(self, piece_idx: int, offset: int, block_data: bytes, source_peer_id: Optional[str] = None):
         if piece_idx not in self.trackers:
             return
 
@@ -205,8 +207,11 @@ class PieceManager:
 
         if marked:
             self.writer.receive_block(piece_idx, offset, block_data)
+            if source_peer_id:
+                self.piece_contributors.setdefault(piece_idx, set()).add(source_peer_id)
 
         if tracker.is_piece_complete():
+            contributors = list(self.piece_contributors.pop(piece_idx, set()))
             is_valid = self.writer.verify_and_save_piece(piece_idx)
             if is_valid:
                 self.have_pieces[piece_idx] = True
@@ -214,6 +219,7 @@ class PieceManager:
                 self._persist_resume_state()
                 print(f"{Fore.GREEN}[+] SUCCESS: Piece #{piece_idx} validated and saved.{Style.RESET_ALL}")
             else:
+                self.last_corrupt_peers = contributors
                 print(f"{Fore.RED}[-] Piece #{piece_idx} verification failed. Resetting blocks.{Style.RESET_ALL}")
                 for b in tracker.blocks:
                     b.reset()
