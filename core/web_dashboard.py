@@ -33,7 +33,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="container">
   <header>
     <h1>Py-BitTorrent Engine</h1>
-    <span class="badge">BEP-3 / BEP-5 DHT / BEP-9 / BEP-11 PEX / BEP-14 LPD / BEP-15 UDP</span>
+    <span class="badge">BEP-3 / BEP-5 DHT / BEP-9 / BEP-11 PEX / BEP-14 LPD / BEP-15 UDP / BEP-19</span>
   </header>
   <div class="add-bar">
     <input id="targetInput" type="text" placeholder="Paste magnet:?xt=urn:btih:... URI or local .torrent file path">
@@ -112,8 +112,8 @@ fetchStats();
 
 class WebControlServer:
     """
-    Lightweight zero-dependency asynchronous HTTP/JSON REST API and Web Dashboard
-    for real-time multi-torrent orchestration and monitoring.
+    Lightweight zero-dependency asynchronous HTTP/JSON REST API, Prometheus metrics
+    exporter, and Web Dashboard for real-time multi-torrent orchestration.
     """
 
     def __init__(self, session_manager: MultiTorrentSessionManager, host: str = "127.0.0.1", port: int = 8080):
@@ -134,6 +134,37 @@ class WebControlServer:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+
+    def render_prometheus_metrics(self) -> str:
+        """
+        Exports engine telemetry in standard Prometheus text exposition format.
+        """
+        telemetry = self.session_manager.get_all_telemetry()
+        total_torrents = len(telemetry)
+        total_down_bps = sum(item["download_speed_bps"] for item in telemetry)
+        total_up_bps = sum(item["upload_speed_bps"] for item in telemetry)
+        total_connected_peers = sum(item["connected_peers"] for item in telemetry)
+        banned_peers_count = len(self.session_manager.peer_guard.get_banned_summary())
+
+        lines = [
+            "# HELP bittorrent_managed_torrents Total number of managed torrent sessions",
+            "# TYPE bittorrent_managed_torrents gauge",
+            f"bittorrent_managed_torrents {total_torrents}",
+            "# HELP bittorrent_download_speed_bytes_per_sec Aggregate download throughput in bytes/sec",
+            "# TYPE bittorrent_download_speed_bytes_per_sec gauge",
+            f"bittorrent_download_speed_bytes_per_sec {total_down_bps}",
+            "# HELP bittorrent_upload_speed_bytes_per_sec Aggregate upload throughput in bytes/sec",
+            "# TYPE bittorrent_upload_speed_bytes_per_sec gauge",
+            f"bittorrent_upload_speed_bytes_per_sec {total_up_bps}",
+            "# HELP bittorrent_connected_peers Total active TCP peer connections",
+            "# TYPE bittorrent_connected_peers gauge",
+            f"bittorrent_connected_peers {total_connected_peers}",
+            "# HELP bittorrent_banned_peers Total hostile IPs currently banned by PeerGuard",
+            "# TYPE bittorrent_banned_peers gauge",
+            f"bittorrent_banned_peers {banned_peers_count}",
+            ""
+        ]
+        return "\n".join(lines)
 
     @staticmethod
     def _build_http_response(status_code: int, content_type: str, body_bytes: bytes) -> bytes:
@@ -184,8 +215,18 @@ class WebControlServer:
                 await writer.drain()
                 return
 
+            if method == "GET" and path == "/metrics":
+                metrics_text = self.render_prometheus_metrics()
+                resp = self._build_http_response(200, "text/plain; version=0.0.4", metrics_text.encode("utf-8"))
+                writer.write(resp)
+                await writer.drain()
+                return
+
             if method == "GET" and path == "/api/torrents":
-                payload = {"torrents": self.session_manager.get_all_telemetry()}
+                payload = {
+                    "torrents": self.session_manager.get_all_telemetry(),
+                    "banned_peers": self.session_manager.peer_guard.get_banned_summary()
+                }
                 resp = self._build_http_response(200, "application/json", json.dumps(payload).encode("utf-8"))
                 writer.write(resp)
                 await writer.drain()
