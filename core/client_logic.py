@@ -8,11 +8,13 @@ from core.choking_manager import TitForTatChoker
 from core.dht_client import DHTCrawler
 from core.extension_protocol import ExtensionProtocol, MetadataAssembler
 from core.magnet_parser import MagnetLinkData
+from core.peer_guard import PeerGuard
 from core.pex_protocol import PeerExchangeProtocol
 from core.piece_manager import PieceManager
 from core.protocol_messages import TorrentMessage
 from core.rate_limiter import BandwidthMonitor, TokenBucketRateLimiter
 from core.tracker_client import TrackerClient
+from core.webseed_client import WebSeedClient
 
 init(autoreset=True)
 
@@ -24,9 +26,9 @@ class BitTorrentClient:
     - Rarest-First piece selection & End-Game mode
     - Magnet URI resolution (BEP-0009 / BEP-0010)
     - Peer Exchange (BEP-0011) & Kademlia DHT (BEP-0005)
+    - HTTP/HTTPS WebSeeding (BEP-0019)
     - Incoming TCP listener & Tit-for-Tat choking/seeding engine
-    - Token Bucket rate limiting & real-time speed/ETA telemetry
-    - Fast-Resume state persistence across restarts
+    - Token Bucket rate limiting, Fast-Resume, and PeerGuard anti-poisoning
     """
 
     def __init__(
@@ -35,7 +37,8 @@ class BitTorrentClient:
         enable_dht: bool = True,
         listen_port: int = 6881,
         max_download_rate: Optional[int] = None,
-        max_upload_rate: Optional[int] = None
+        max_upload_rate: Optional[int] = None,
+        peer_guard: Optional[PeerGuard] = None
     ):
         self.metadata = torrent_metadata
         self.enable_dht = enable_dht
@@ -90,6 +93,9 @@ class BitTorrentClient:
             self.num_pieces = len(self.piece_hashes)
         else:
             self.num_pieces = 1
+
+        self.webseed_urls = WebSeedClient.extract_webseeds_from_metadata(torrent_metadata)
+        self.peer_guard = peer_guard or PeerGuard()
 
         self.active_connections: Dict[str, AsyncPeerConnection] = {}
         self.known_peers: Set[Tuple[str, int]] = set()
@@ -214,6 +220,11 @@ class BitTorrentClient:
             remote_port = peer_addr[1] if peer_addr else 0
             peer_tag = f"{ip}:{remote_port}"
 
+            if not self.peer_guard.is_ip_allowed(ip):
+                writer.close()
+                await writer.wait_closed()
+                return
+
             try:
                 hs_bytes = await asyncio.wait_for(reader.readexactly(68), timeout=5.0)
                 pstrlen = hs_bytes[0]
@@ -296,6 +307,27 @@ class BitTorrentClient:
         except asyncio.CancelledError:
             pass
 
+    async def _webseed_worker_loop(self, manager: PieceManager):
+        """
+        Downloads missing pieces in parallel from HTTP/HTTPS WebSeeds (BEP-0019).
+        """
+        if not self.webseed_urls:
+            return
+
+        ws_client = WebSeedClient(self.webseed_urls)
+        print(f"{Fore.CYAN}[*] BEP-0019 WebSeed active ({len(self.webseed_urls)} mirror(s)){Style.RESET_ALL}")
+
+        for piece_idx in range(manager.num_pieces):
+            if all(manager.have_pieces):
+                break
+            if manager.have_pieces[piece_idx]:
+                continue
+            ok = await ws_client.download_piece_from_webseed(manager, piece_idx)
+            if ok:
+                piece_size = manager.get_piece_size(piece_idx)
+                await self.download_limiter.acquire(piece_size)
+                self.bandwidth_monitor.record_download(piece_size)
+
     def _spawn_peer_worker_if_new(
         self,
         ip: str,
@@ -305,6 +337,9 @@ class BitTorrentClient:
         manager: PieceManager,
         max_peers: int
     ):
+        if not self.peer_guard.is_ip_allowed(ip):
+            return
+
         peer_addr = (ip, port)
         if peer_addr in self.known_peers:
             return
@@ -334,11 +369,15 @@ class BitTorrentClient:
         max_peers: int = 25,
         pipeline_depth: int = 4
     ):
+        if not self.peer_guard.is_ip_allowed(ip):
+            return
+
         peer_tag = f"{ip}:{port}"
         peer_conn = AsyncPeerConnection(ip, port, raw_info_hash, my_peer_id, timeout=5.0)
 
         connected = await peer_conn.connect_and_handshake()
         if not connected:
+            self.peer_guard.record_timeout(ip)
             return
 
         await self._run_peer_session(
@@ -363,6 +402,7 @@ class BitTorrentClient:
         pipeline_depth: int = 4,
         stop_when_complete: bool = True
     ):
+        peer_ip = peer_tag.rsplit(":", 1)[0]
         self.active_connections[peer_tag] = peer_conn
         manager.register_peer(peer_tag)
         self.choker.register_peer(peer_tag)
@@ -381,6 +421,9 @@ class BitTorrentClient:
                 await peer_conn.send_message(TorrentMessage.create_interested())
 
             while True:
+                if not self.peer_guard.is_ip_allowed(peer_ip):
+                    break
+
                 if stop_when_complete and all(manager.have_pieces):
                     break
 
@@ -458,6 +501,19 @@ class BitTorrentClient:
                     was_complete = list(manager.have_pieces)
                     cancel_tasks = manager.handle_message(raw_msg, source_peer_id=peer_tag)
 
+                    # Penalize contributors if SHA-1 check failed
+                    if manager.last_corrupt_peers:
+                        for bad_peer_tag in manager.last_corrupt_peers:
+                            bad_ip = bad_peer_tag.rsplit(":", 1)[0]
+                            banned_now = self.peer_guard.record_corrupt_data(bad_ip)
+                            if banned_now:
+                                print(f"{Fore.RED}[!] PeerGuard AUTO-BANNED hostile peer IP: {bad_ip}{Style.RESET_ALL}")
+                                bad_conn = self.active_connections.get(bad_peer_tag)
+                                if bad_conn is not None:
+                                    await bad_conn.close()
+                    else:
+                        self.peer_guard.record_valid_contribution(peer_ip)
+
                     for idx, now_have in enumerate(manager.have_pieces):
                         if now_have and not was_complete[idx]:
                             have_pkt = TorrentMessage.create_have(idx)
@@ -524,6 +580,9 @@ class BitTorrentClient:
         )
 
         choker_task = asyncio.create_task(self._choking_scheduler_loop(manager, interval=10.0))
+        webseed_task: Optional[asyncio.Task] = None
+        if self.webseed_urls and not all(manager.have_pieces):
+            webseed_task = asyncio.create_task(self._webseed_worker_loop(manager))
 
         tracker_url = self.metadata.get(b"announce") or self.metadata.get("announce")
         if isinstance(tracker_url, bytes):
@@ -553,7 +612,7 @@ class BitTorrentClient:
                 if p not in discovered_peers:
                     discovered_peers.append(p)
 
-        if not discovered_peers:
+        if not discovered_peers and not self.webseed_urls:
             print(f"{Fore.YELLOW}[*] No external peers found. Setting local swarm test entry (127.0.0.1:6881)...{Style.RESET_ALL}")
             discovered_peers = [("127.0.0.1", 6881)]
 
@@ -578,6 +637,8 @@ class BitTorrentClient:
                 if not t.done():
                     all_done = False
                     break
+            if webseed_task is not None and not webseed_task.done():
+                all_done = False
 
             if all_done and len(self.active_connections) == 0:
                 print(f"{Fore.RED}[-] All active workers finished or disconnected.{Style.RESET_ALL}")
@@ -606,6 +667,8 @@ class BitTorrentClient:
                 pass
 
         choker_task.cancel()
+        if webseed_task is not None and not webseed_task.done():
+            webseed_task.cancel()
         for t in self.worker_tasks:
             if not t.done():
                 t.cancel()
