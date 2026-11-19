@@ -1,95 +1,110 @@
-# Py-BitTorrent Client Engine
+# Py-BitTorrent Enterprise Engine
 
-A modular BitTorrent client engine built from scratch in Python 3, adhering directly to the official BitTorrent specifications (BEP-3, BEP-15, and BEP-23) without external torrent libraries.
+A production-grade, asynchronous BitTorrent client, seeder, torrent creator, and multi-torrent daemon written entirely in Python 3.10+. No external BitTorrent libraries are used — every protocol detail is implemented from the ground up with `asyncio` and the Python standard library.
 
----
-
-## Features
-
-- **Pure Bencode Parser (`core/parser.py`)**: Implements strict encoding and decoding for byte strings, integers, lists, and ordered dictionaries with canonical serialization.
-- **Binary Wire Protocol (`core/protocol_messages.py`)**: Complete implementation of BEP-3 peer framing, supporting `keep-alive`, `choke`, `unchoke`, `interested`, `not_interested`, `have`, `bitfield`, `request`, `piece`, and `cancel`.
-- **Dual Tracker Engine (`core/tracker_client.py`)**:
-  - **HTTP/HTTPS (BEP-3)**: Handles Bencoded tracker announcements and compact peer extraction.
-  - **UDP Tracker (BEP-15)**: Implements binary packet flow (`connect` handshake, transaction verification, and `announce` exchange).
-  - **Compact Peer Representation (BEP-23)**: Parses network byte order 6-byte chunks (4-byte IPv4 + 2-byte port).
-- **Seek-based Block Storage (`core/reassemble.py`)**: Uses random-access pre-allocated file structures and SHA-1 cryptographic validation per piece.
-- **Edge Piece & Block Management (`core/piece_manager.py`)**: Accurately computes variable boundaries for the final truncated piece and tracks block offsets.
+The engine supports eight official BitTorrent Enhancement Proposals (BEPs), a live Web Control Dashboard, a JSON REST API, Prometheus metrics, and an active anti-poisoning security layer.
 
 ---
 
-## Architecture Overview
+## Supported Standards
 
-.torrent Metainfo
-│
-▼
-Bencode Parser (BDecoder)
-│
-▼
-Info Hash (SHA-1) & Peer ID
-│
-▼
-Tracker Client (HTTP / UDP Tracker Protocol)
-│
-▼
-Discovered Swarm Peers
-│
-▼
-TCP Binary Handshake & Framed Wire Protocol
-│
-▼
-Piece / Block Offset Manager
-│
-▼
-SHA-1 Hash Verification
-│
-▼
-Pre-allocated Seek-based Persistent File
-
+| BEP | Description |
+| :--- | :--- |
+| **BEP-0003** | Core protocol, Bencode, TCP wire messages, SHA-1 piece verification |
+| **BEP-0005** | Kademlia DHT for trackerless peer discovery |
+| **BEP-0009** | `ut_metadata` – fetch torrent metadata from peers (magnet links) |
+| **BEP-0010** | Extension Protocol handshake |
+| **BEP-0011** | Peer Exchange (`ut_pex`) |
+| **BEP-0014** | Local Peer Discovery over IPv4 multicast |
+| **BEP-0015** | UDP Tracker Protocol |
+| **BEP-0019** | HTTP/HTTPS WebSeeding |
 
 ---
 
-## Getting Started
+## Architecture
 
-### Prerequisites
+The codebase is organized under `core/` and is deliberately modular:
 
-- Python 3.10+
-- Virtual environment (`venv`)
+### Protocol & Parsing
+- `parser.py` – recursive Bencode decoder and strict canonical encoder
+- `protocol_messages.py` – all standard wire messages (`CHOKE`, `UNCHOKE`, `INTERESTED`, `NOT_INTERESTED`, `HAVE`, `BITFIELD`, `REQUEST`, `PIECE`, `CANCEL`, `KEEP_ALIVE`)
+- `magnet_parser.py` – full magnet URI support (hex and base32 info-hashes)
+- `extension_protocol.py` – BEP-10 handshake + BEP-9 metadata assembler
 
-### Installation
+### Peer Discovery & Networking
+- `async_peer.py` – non-blocking TCP connections and handshake validation
+- `tracker_client.py` / `udp_tracker.py` – unified HTTP and binary UDP trackers
+- `dht_client.py` – Kademlia DHT node and iterative crawler
+- `pex_protocol.py` – compact peer list encoding/decoding
+- `lpd_service.py` – multicast Local Peer Discovery
+- `webseed_client.py` – HTTP Range requests against web seeds
 
-1. Clone repository:
-   ```bash
-   git clone [https://github.com/MahdiAlizade/py-bittorrent-client.git](https://github.com/MahdiAlizade/py-bittorrent-client.git)
-   cd py-bittorrent-client
-Activate virtual environment:
+### Transfer Logic
+- `piece_selector.py` – rarest-first selection
+- `block_picker.py` – 16 KiB block tracking with pipelining
+- `piece_manager.py` – block requests, end-game mode, seeding, contributor tracking
+- `choking_manager.py` – tit-for-tat + optimistic unchoke (every 10 s)
+- `rate_limiter.py` – token-bucket download/upload limits and throughput monitoring
 
-Windows (PowerShell):
+### Storage & Creation
+- `reassemble.py` / `multi_file_storage.py` – random-access disk I/O for single- and multi-file torrents
+- `resume_manager.py` – atomic fast-resume state
+- `torrent_creator.py` – generate `.torrent` files and magnet links from files or directories
 
-PowerShell
-.\venv\Scripts\Activate.ps1
-Linux / macOS:
+### Security & Control Plane
+- `peer_guard.py` – CIDR blocklists, trust scoring, automatic bans for peers that send corrupt pieces
+- `session_manager.py` – concurrent multi-torrent management, shared LPD/PeerGuard, hot watch folder
+- `web_dashboard.py` – zero-dependency async HTTP server providing:
+  - Live HTML/JS dashboard (`GET /`)
+  - JSON REST API (`/api/torrents`, `/api/torrents/pause`, `/api/torrents/resume`)
+  - Prometheus metrics (`GET /metrics`)
 
+---
+
+## CLI Modes
+
+### Single torrent / magnet download
+
+```bash
+python main.py file.torrent --port 6881 --seed --max-down 500 --max-up 200
+python main.py "magnet:?xt=urn:btih:..." --max-peers 40
+Multi-torrent daemon + web UI
 Bash
-source venv/bin/activate
-Install dependencies:
+python main.py --daemon --web-port 8080 --port 6881 --watch-dir ./watch --blocklist 192.0.2.0/24
+Open http://127.0.0.1:8080 in your browser for the live dashboard.
 
+Create a torrent
 Bash
+python main.py --create ./source_folder \
+               --out ./release.torrent \
+               --tracker udp://tracker.opentrackr.org:1337/announce \
+               --piece-size 256
+Installation
+Bash
+git clone [https://github.com/Mahdi-Alizade/py-bittorrent-client.git](https://github.com/Mahdi-Alizade/py-bittorrent-client.git)
+cd py-bittorrent-client
+python -m venv venv
+source venv/bin/activate          # Windows PowerShell: .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-Usage
-1. Generate Local Test Torrent
-Create an authentic test payload and corresponding .torrent file:
+Python 3.10 or newer is required. External dependencies are deliberately minimal: colorama, pytest, and pytest-asyncio.
 
-PowerShell
-python generate_test_torrent.py
-2. Run the Download Engine
-Start the engine by providing a path to any valid .torrent file:
+Testing
+The project ships with 81 automated unit and integration tests covering Bencode, wire framing, async sockets, DHT, PEX, LPD, WebSeed, choking, rate limiting, fast-resume, PeerGuard, and the web control plane.
 
-PowerShell
-python main.py data/sample.txt.torrent --max-peers 10
-Automated Test Suite
-The engine includes 29 unit and integration tests covering parser bounds, protocol framing, tracker responses, and storage integrity:
+Bash
+python -m pytest -v
+Design Notes
+Every protocol byte is handled in pure Python. There are no bindings to libtorrent or similar libraries.
 
-PowerShell
-python -m pytest
+The client is fully bidirectional — it both leeches and seeds.
+
+Fast-resume state is written atomically after every verified piece.
+
+PeerGuard actively tracks which peers contributed to each piece and bans those that send bad data.
+
+The web dashboard and metrics endpoint require no extra frameworks; they are implemented with the standard library only.
+
 License
-MIT License.
+MIT
+
+Built by Mahdi Alizade.
