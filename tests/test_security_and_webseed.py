@@ -1,10 +1,14 @@
 import hashlib
+import struct
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from core.peer_guard import PeerGuard
 from core.piece_manager import PieceManager
+from core.protocol_messages import TorrentMessage
+from core.session_manager import MultiTorrentSessionManager
+from core.torrent_creator import TorrentCreator
 from core.webseed_client import WebSeedClient
 
 
@@ -15,12 +19,10 @@ def test_peer_guard_cidr_and_anti_poisoning_ban():
     assert guard.is_ip_allowed("192.168.100.45") is False
     assert guard.is_ip_allowed("10.0.0.5") is True
 
-    # First corrupt strike does not ban yet
     banned_first = guard.record_corrupt_data("203.0.113.99")
     assert banned_first is False
     assert guard.is_ip_allowed("203.0.113.99") is True
 
-    # Second corrupt strike triggers automatic ban
     banned_second = guard.record_corrupt_data("203.0.113.99")
     assert banned_second is True
     assert guard.is_ip_allowed("203.0.113.99") is False
@@ -69,3 +71,36 @@ async def test_webseed_bep19_http_range_download(tmp_path):
     assert (tmp_path / "webseed_iso.bin").read_bytes() == full_file_content
 
     httpd.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_watch_folder_and_corrupt_contributor_attribution(tmp_path):
+    # 1. Verify PieceManager attributes corrupt pieces to the sending peer
+    valid_hash = hashlib.sha1(b"V" * 16384).digest()
+    pm = PieceManager("guard_test.bin", piece_length=16384, num_pieces=1, total_length=16384)
+    pm.writer.output_dir = tmp_path
+    pm.writer.final_path = tmp_path / "guard_test.bin"
+    pm.writer.initialize_file()
+    pm.writer.piece_hashes = [valid_hash]
+
+    corrupt_pkt = struct.pack(">IBII", 9 + 16384, TorrentMessage.MSG_PIECE, 0, 0) + (b"X" * 16384)
+    pm.handle_message(corrupt_pkt, source_peer_id="198.51.100.77:6881")
+    assert pm.last_corrupt_peers == ["198.51.100.77:6881"]
+
+    # 2. Verify Hot Watch-Folder automatically ingests dropped .torrent files
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    src_file = tmp_path / "auto_item.bin"
+    src_file.write_bytes(b"M" * 16384)
+    TorrentCreator(str(src_file), piece_length=16384).save_torrent_file(str(watch_dir / "auto_item.torrent"))
+
+    session_mgr = MultiTorrentSessionManager(
+        peer_id=b"-PY0001-111122223333",
+        listen_port=0,
+        enable_dht=False,
+        enable_lpd=False,
+        watch_dir=str(watch_dir)
+    )
+    ingested = await session_mgr.scan_watch_folder_once(auto_start=False)
+    assert ingested == 1
+    assert len(session_mgr.sessions) == 1
