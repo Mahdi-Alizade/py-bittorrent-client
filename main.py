@@ -11,6 +11,7 @@ from core.client_logic import BitTorrentClient
 from core.extension_protocol import ExtensionProtocol
 from core.magnet_parser import MagnetURIParser
 from core.parser import BDecoder, TorrentEncoder
+from core.peer_guard import PeerGuard
 from core.session_manager import MultiTorrentSessionManager
 from core.torrent_creator import TorrentCreator
 from core.web_dashboard import WebControlServer
@@ -47,6 +48,16 @@ def calculate_info_hash_from_raw_torrent(raw_torrent_bytes: bytes, fallback_info
     return calculate_info_hash(fallback_info)
 
 
+def build_peer_guard(blocklist_cidrs: list) -> PeerGuard:
+    guard = PeerGuard()
+    for cidr in blocklist_cidrs or []:
+        try:
+            guard.add_cidr_block(cidr)
+        except Exception as exc:
+            print(f"{Fore.YELLOW}[!] Invalid CIDR blocklist entry '{cidr}': {exc}{Style.RESET_ALL}")
+    return guard
+
+
 def handle_create_mode(args):
     source_path = args.create
     output_path = args.out or f"{Path(source_path).name}.torrent"
@@ -74,13 +85,15 @@ def handle_create_mode(args):
     print(f"{Fore.YELLOW}[*] Magnet URI:{Style.RESET_ALL}\n{magnet_uri}")
 
 
-async def run_daemon_mode(args, peer_id: bytes, use_dht: bool):
+async def run_daemon_mode(args, peer_id: bytes, use_dht: bool, guard: PeerGuard):
     session_mgr = MultiTorrentSessionManager(
         peer_id=peer_id,
         listen_port=args.port,
         enable_dht=use_dht,
         enable_lpd=True,
-        max_peers_per_torrent=args.max_peers
+        max_peers_per_torrent=args.max_peers,
+        watch_dir=args.watch_dir,
+        peer_guard=guard
     )
     session_mgr.start_background_services()
 
@@ -94,6 +107,8 @@ async def run_daemon_mode(args, peer_id: bytes, use_dht: bool):
     print(f"{Fore.CYAN}=== Py-BitTorrent Multi-Torrent Daemon ==={Style.RESET_ALL}")
     print(f"{Fore.GREEN}[+] Web Control Dashboard: http://127.0.0.1:{bound_web_port}{Style.RESET_ALL}")
     print(f"[*] P2P Listen Port: {args.port} | DHT: {'ON' if use_dht else 'OFF'} | LPD: ON")
+    if args.watch_dir:
+        print(f"[*] Hot Watch-Folder Active: {Path(args.watch_dir).resolve()}")
 
     if args.target:
         target_str = args.target.strip()
@@ -119,6 +134,8 @@ def main():
     parser.add_argument("target", nargs="?", help="Path to a .torrent file or a magnet:? URI.")
     parser.add_argument("--daemon", action="store_true", help="Run multi-torrent engine with live Web Control Dashboard.")
     parser.add_argument("--web-port", type=int, default=8080, help="HTTP port for the Web Control Dashboard (default: 8080).")
+    parser.add_argument("--watch-dir", type=str, help="Folder to auto-ingest new .torrent files in daemon mode.")
+    parser.add_argument("--blocklist", action="append", help="CIDR IP range(s) to block (e.g., 192.0.2.0/24).")
     parser.add_argument("--create", type=str, help="Create a .torrent file and magnet URI from a file or folder.")
     parser.add_argument("--out", type=str, help="Output .torrent file path when using --create.")
     parser.add_argument("--tracker", action="append", help="Tracker announce URL(s) when using --create.")
@@ -137,10 +154,11 @@ def main():
 
     peer_id = generate_peer_id()
     use_dht = not args.no_dht
+    guard = build_peer_guard(args.blocklist)
 
     if args.daemon:
         try:
-            asyncio.run(run_daemon_mode(args, peer_id=peer_id, use_dht=use_dht))
+            asyncio.run(run_daemon_mode(args, peer_id=peer_id, use_dht=use_dht, guard=guard))
         except KeyboardInterrupt:
             pass
         return
@@ -211,7 +229,8 @@ def main():
         enable_dht=use_dht,
         listen_port=args.port,
         max_download_rate=max_down_bytes,
-        max_upload_rate=max_up_bytes
+        max_upload_rate=max_up_bytes,
+        peer_guard=guard
     )
     client.start_download_loop(
         raw_info_hash=info_hash,
