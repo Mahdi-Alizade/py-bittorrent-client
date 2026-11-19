@@ -33,7 +33,6 @@ async def _send_raw_http(port: int, method: str, path: str, json_body: dict = No
 
 @pytest.mark.asyncio
 async def test_multi_torrent_session_and_web_api(tmp_path):
-    # Create two distinct .torrent files
     f1 = tmp_path / "alpha.bin"
     f1.write_bytes(b"A" * 16384)
     t1_path = tmp_path / "alpha.torrent"
@@ -54,16 +53,13 @@ async def test_multi_torrent_session_and_web_api(tmp_path):
     web_server = WebControlServer(session_manager=manager, host="127.0.0.1", port=0)
     web_port = await web_server.start()
 
-    # 1. Verify HTML Dashboard renders
     code_html, html_body = await _send_raw_http(web_port, "GET", "/")
     assert code_html == 200
     assert "Py-BitTorrent Engine" in html_body
 
-    # 2. Add two torrents concurrently (without starting external peer loop in unit test)
     await manager.add_torrent_file(str(t1_path), auto_start=False)
     await manager.add_torrent_file(str(t2_path), auto_start=False)
 
-    # 3. Query REST API /api/torrents
     code_api, api_body = await _send_raw_http(web_port, "GET", "/api/torrents")
     assert code_api == 200
     parsed = json.loads(api_body)
@@ -72,7 +68,11 @@ async def test_multi_torrent_session_and_web_api(tmp_path):
     names = {item["name"] for item in parsed["torrents"]}
     assert names == {"alpha.bin", "beta.bin"}
 
-    # 4. Test pause endpoint via REST API
+    # Verify Prometheus /metrics endpoint
+    code_metrics, metrics_body = await _send_raw_http(web_port, "GET", "/metrics")
+    assert code_metrics == 200
+    assert "bittorrent_managed_torrents 2" in metrics_body
+
     code_pause, pause_body = await _send_raw_http(
         web_port,
         "POST",
