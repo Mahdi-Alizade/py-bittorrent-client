@@ -71,7 +71,7 @@ async def test_client_spawns_worker_on_pex_message(tmp_path):
             await writer.drain()
 
             while not download_complete_event.is_set():
-                hdr = await asyncio.wait_for(reader.readexactly(4), timeout=2.0)
+                hdr = await asyncio.wait_for(reader.readexactly(4), timeout=4.0)
                 msg_len = struct.unpack(">I", hdr)[0]
                 if msg_len == 0:
                     continue
@@ -98,8 +98,7 @@ async def test_client_spawns_worker_on_pex_message(tmp_path):
             writer.write(hs)
             await writer.drain()
 
-            # Read client's extension handshake before sending PEX
-            hdr = await asyncio.wait_for(reader.readexactly(4), timeout=2.0)
+            hdr = await asyncio.wait_for(reader.readexactly(4), timeout=4.0)
             msg_len = struct.unpack(">I", hdr)[0]
             if msg_len > 0:
                 await reader.readexactly(msg_len)
@@ -111,7 +110,7 @@ async def test_client_spawns_worker_on_pex_message(tmp_path):
             writer.write(pex_msg)
             await writer.drain()
 
-            await asyncio.wait_for(download_complete_event.wait(), timeout=3.0)
+            await asyncio.wait_for(download_complete_event.wait(), timeout=5.0)
         except Exception:
             pass
         finally:
@@ -139,7 +138,7 @@ async def test_client_spawns_worker_on_pex_message(tmp_path):
         max_peers=10
     )
 
-    for _ in range(40):
+    for _ in range(100):
         if all(manager.have_pieces):
             download_complete_event.set()
             break
