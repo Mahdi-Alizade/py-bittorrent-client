@@ -2,13 +2,14 @@ import asyncio
 import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from core.client_logic import BitTorrentClient
 from core.extension_protocol import ExtensionProtocol
 from core.lpd_service import LocalPeerDiscovery
 from core.magnet_parser import MagnetURIParser
 from core.parser import BDecoder, TorrentEncoder
+from core.peer_guard import PeerGuard
 from core.piece_manager import PieceManager
 
 
@@ -21,7 +22,7 @@ class ManagedTorrentSession:
     num_pieces: int
     client: BitTorrentClient
     manager: PieceManager
-    status: str = "downloading"  # downloading | seeding | paused | completed | error
+    status: str = "downloading"
     task: Optional[asyncio.Task] = None
     error_message: Optional[str] = None
     trackers: List[str] = field(default_factory=list)
@@ -30,7 +31,8 @@ class ManagedTorrentSession:
 class MultiTorrentSessionManager:
     """
     Central orchestration engine managing multiple concurrent BitTorrent downloads
-    and seeding sessions, unified Local Peer Discovery (BEP-0014), and live telemetry.
+    and seeding sessions, unified Local Peer Discovery (BEP-0014), shared PeerGuard
+    IP filtering, Hot Watch-Folder ingestion, and live telemetry.
     """
 
     def __init__(
@@ -39,18 +41,24 @@ class MultiTorrentSessionManager:
         listen_port: int = 6881,
         enable_dht: bool = True,
         enable_lpd: bool = True,
-        max_peers_per_torrent: int = 25
+        max_peers_per_torrent: int = 25,
+        watch_dir: Optional[str] = None,
+        peer_guard: Optional[PeerGuard] = None
     ):
         self.peer_id = peer_id
         self.listen_port = listen_port
         self.enable_dht = enable_dht
         self.enable_lpd = enable_lpd
         self.max_peers_per_torrent = max_peers_per_torrent
+        self.watch_dir = Path(watch_dir) if watch_dir else None
+        self.peer_guard = peer_guard or PeerGuard()
 
         self.sessions: Dict[str, ManagedTorrentSession] = {}
         self.lpd = LocalPeerDiscovery(listen_port=listen_port)
         self.lpd.on_peer_discovered = self._handle_lpd_peer_found
         self._lpd_task: Optional[asyncio.Task] = None
+        self._watch_task: Optional[asyncio.Task] = None
+        self._ingested_watch_files: Set[str] = set()
 
     def start_background_services(self):
         if self.enable_lpd and self._lpd_task is None:
@@ -59,11 +67,52 @@ class MultiTorrentSessionManager:
             except RuntimeError:
                 pass
 
+        if self.watch_dir is not None and self._watch_task is None:
+            try:
+                self._watch_task = asyncio.create_task(self._watch_folder_loop())
+            except RuntimeError:
+                pass
+
     def stop_background_services(self):
         self.lpd.stop()
         if self._lpd_task is not None and not self._lpd_task.done():
             self._lpd_task.cancel()
             self._lpd_task = None
+        if self._watch_task is not None and not self._watch_task.done():
+            self._watch_task.cancel()
+            self._watch_task = None
+
+    async def scan_watch_folder_once(self, auto_start: bool = True) -> int:
+        """
+        Scans watch_dir for new .torrent files and ingests them automatically.
+        Returns the count of newly added torrents.
+        """
+        if self.watch_dir is None:
+            return 0
+
+        self.watch_dir.mkdir(parents=True, exist_ok=True)
+        added_count = 0
+
+        for file_path in sorted(self.watch_dir.glob("*.torrent")):
+            key = str(file_path.resolve())
+            if key in self._ingested_watch_files:
+                continue
+            try:
+                await self.add_torrent_file(key, auto_start=auto_start)
+                self._ingested_watch_files.add(key)
+                added_count += 1
+            except Exception:
+                pass
+
+        return added_count
+
+    async def _watch_folder_loop(self, poll_interval: float = 2.0):
+        try:
+            while True:
+                await self.scan_watch_folder_once(auto_start=True)
+                await asyncio.sleep(poll_interval)
+        except asyncio.CancelledError:
+            pass
 
     def _handle_lpd_peer_found(self, info_hash_hex: str, peer_ip: str, peer_port: int):
         session = self.sessions.get(info_hash_hex.lower())
@@ -103,7 +152,8 @@ class MultiTorrentSessionManager:
         client = BitTorrentClient(
             torrent_metadata=metadata,
             enable_dht=self.enable_dht,
-            listen_port=self.listen_port
+            listen_port=self.listen_port,
+            peer_guard=self.peer_guard
         )
 
         manager = PieceManager(
@@ -219,9 +269,6 @@ class MultiTorrentSessionManager:
         return True
 
     def get_all_telemetry(self) -> List[dict]:
-        """
-        Returns real-time JSON-serializable telemetry for all managed torrents.
-        """
         snapshots: List[dict] = []
         for hex_id, session in self.sessions.items():
             completed = sum(1 for flag in session.manager.have_pieces if flag)
